@@ -4,7 +4,8 @@ using UnityEngine;
 
 public class Chunk : MonoBehaviour
 {
-    public const int CHUNK_SIZE = 16;
+    public const int CHUNK_SIZE = 32;
+    public const float VOXEL_SIZE = 0.25f;
     
     private float[,,] voxelData;
     private MeshFilter meshFilter;
@@ -12,19 +13,21 @@ public class Chunk : MonoBehaviour
     private MeshCollider meshCollider;
     
     public Vector3Int Coordinate { get; private set; }
+    public int LODLevel { get; private set; }
     
-    // Mesh generation optimization
+    // Mesh generation
     private List<Vector3> vertices = new List<Vector3>();
     private List<int> triangles = new List<int>();
     private List<Vector3> normals = new List<Vector3>();
+    private List<Vector2> uvs = new List<Vector2>();
     
-    // Mesh generation mode
-    public enum MeshingMode { Simple, Greedy }
-    public MeshingMode meshingMode = MeshingMode.Greedy;
+    // Marching cubes lookup tables
+    private static readonly int[] edgeTable = new int[256];
+    private static readonly int[,] triTable = new int[256, 16];
     
     void Awake()
     {
-        voxelData = new float[CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE];
+        voxelData = new float[CHUNK_SIZE + 1, CHUNK_SIZE + 1, CHUNK_SIZE + 1];
         
         meshFilter = GetComponent<MeshFilter>();
         if (meshFilter == null)
@@ -37,15 +40,18 @@ public class Chunk : MonoBehaviour
         meshCollider = GetComponent<MeshCollider>();
         if (meshCollider == null)
             meshCollider = gameObject.AddComponent<MeshCollider>();
+            
+        InitializeMarchingCubesTables();
     }
     
-    public void Initialize(Vector3Int coordinate, Material material)
+    public void Initialize(Vector3Int coordinate, Material material, int lodLevel = 0)
     {
         Coordinate = coordinate;
+        LODLevel = lodLevel;
         transform.position = new Vector3(
-            coordinate.x * CHUNK_SIZE,
-            coordinate.y * CHUNK_SIZE,
-            coordinate.z * CHUNK_SIZE
+            coordinate.x * CHUNK_SIZE * VOXEL_SIZE,
+            coordinate.y * CHUNK_SIZE * VOXEL_SIZE,
+            coordinate.z * CHUNK_SIZE * VOXEL_SIZE
         );
         
         if (material != null)
@@ -55,69 +61,74 @@ public class Chunk : MonoBehaviour
     public void SetVoxelDataFromJob(NativeArray<float> jobData)
     {
         int index = 0;
-        for (int x = 0; x < CHUNK_SIZE; x++)
+        for (int x = 0; x <= CHUNK_SIZE; x++)
         {
-            for (int y = 0; y < CHUNK_SIZE; y++)
+            for (int y = 0; y <= CHUNK_SIZE; y++)
             {
-                for (int z = 0; z < CHUNK_SIZE; z++)
+                for (int z = 0; z <= CHUNK_SIZE; z++)
                 {
-                    voxelData[x, y, z] = jobData[index++];
+                    if (index < jobData.Length)
+                        voxelData[x, y, z] = jobData[index++];
                 }
             }
         }
     }
     
-    public void GenerateVoxelData(CaveSettings settings)
-    {
-        // Fallback for non-job generation
-        Vector3 chunkWorldPos = transform.position;
-        
-        for (int x = 0; x < CHUNK_SIZE; x++)
-        {
-            for (int y = 0; y < CHUNK_SIZE; y++)
-            {
-                for (int z = 0; z < CHUNK_SIZE; z++)
-                {
-                    Vector3 worldPos = chunkWorldPos + new Vector3(x, y, z);
-                    voxelData[x, y, z] = GenerateDensity(worldPos, settings);
-                }
-            }
-        }
-    }
-    
-    float GenerateDensity(Vector3 pos, CaveSettings settings)
-    {
-        // Simple noise-based generation for fallback
-        float noise = Mathf.PerlinNoise(pos.x * settings.baseFrequency, pos.z * settings.baseFrequency);
-        noise += Mathf.PerlinNoise(pos.x * settings.baseFrequency * 2f, pos.z * settings.baseFrequency * 2f) * 0.5f;
-        noise /= 1.5f;
-        
-        return noise > settings.caveThreshold ? 1f : 0f;
-    }
-    
-    public void GenerateMesh()
+    public void GenerateSmoothMesh()
     {
         vertices.Clear();
         triangles.Clear();
         normals.Clear();
+        uvs.Clear();
         
-        switch (meshingMode)
+        // Debug: Check density values
+        if (LODLevel == 0 && Coordinate == Vector3Int.zero)
         {
-            case MeshingMode.Simple:
-                GenerateSimpleMesh();
-                break;
-            case MeshingMode.Greedy:
-                GenerateGreedyMesh();
-                break;
+            int solidCount = 0;
+            int airCount = 0;
+            for (int x = 0; x <= CHUNK_SIZE; x++)
+            {
+                for (int y = 0; y <= CHUNK_SIZE; y++)
+                {
+                    for (int z = 0; z <= CHUNK_SIZE; z++)
+                    {
+                        if (voxelData[x, y, z] > 0.5f) solidCount++;
+                        else airCount++;
+                    }
+                }
+            }
+            Debug.Log($"Chunk {Coordinate}: Solid voxels: {solidCount}, Air voxels: {airCount}");
+        }
+        
+        // Use simple voxel mesh for testing
+        // GenerateMarchingCubesMesh();
+        GenerateSimpleVoxelMesh();
+        
+        if (vertices.Count == 0)
+        {
+            // No geometry to generate
+            if (meshFilter.mesh != null)
+            {
+                meshFilter.mesh.Clear();
+            }
+            return;
         }
         
         // Create mesh
         Mesh mesh = new Mesh();
-        mesh.name = "Chunk Mesh";
+        mesh.name = "Cave Chunk Mesh";
+        
+        // Use 32-bit indices for meshes with many vertices
+        if (vertices.Count > 65535)
+        {
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        }
+        
         mesh.vertices = vertices.ToArray();
         mesh.triangles = triangles.ToArray();
         
-        if (normals.Count > 0)
+        // Calculate normals if not already done
+        if (normals.Count == vertices.Count)
         {
             mesh.normals = normals.ToArray();
         }
@@ -126,279 +137,256 @@ public class Chunk : MonoBehaviour
             mesh.RecalculateNormals();
         }
         
+        mesh.uv = uvs.ToArray();
         mesh.RecalculateBounds();
+        mesh.RecalculateTangents();
         mesh.Optimize();
         
         meshFilter.mesh = mesh;
         
-        // Only update collider if needed
-        if (meshCollider.enabled)
+        // Update collider with simplified mesh if needed
+        if (meshCollider.enabled && LODLevel == 0)
         {
             meshCollider.sharedMesh = mesh;
         }
     }
     
-    void GenerateSimpleMesh()
+    void GenerateMarchingCubesMesh()
     {
-        // Simple method that generates all faces correctly
+        float isoLevel = 0.5f; // Surface level
+        int stepSize = 1 << LODLevel; // Skip voxels for LOD
+        
+        for (int x = 0; x < CHUNK_SIZE; x += stepSize)
+        {
+            for (int y = 0; y < CHUNK_SIZE; y += stepSize)
+            {
+                for (int z = 0; z < CHUNK_SIZE; z += stepSize)
+                {
+                    ProcessMarchingCubesVoxel(x, y, z, isoLevel, stepSize);
+                }
+            }
+        }
+    }
+    
+    void ProcessMarchingCubesVoxel(int x, int y, int z, float isoLevel, int stepSize)
+    {
+        // Get the 8 corner values
+        float[] cubeCorners = new float[8];
+        cubeCorners[0] = GetVoxelValue(x, y, z);
+        cubeCorners[1] = GetVoxelValue(x + stepSize, y, z);
+        cubeCorners[2] = GetVoxelValue(x + stepSize, y, z + stepSize);
+        cubeCorners[3] = GetVoxelValue(x, y, z + stepSize);
+        cubeCorners[4] = GetVoxelValue(x, y + stepSize, z);
+        cubeCorners[5] = GetVoxelValue(x + stepSize, y + stepSize, z);
+        cubeCorners[6] = GetVoxelValue(x + stepSize, y + stepSize, z + stepSize);
+        cubeCorners[7] = GetVoxelValue(x, y + stepSize, z + stepSize);
+        
+        // Calculate the cube index
+        int cubeIndex = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            if (cubeCorners[i] < isoLevel)
+                cubeIndex |= (1 << i);
+        }
+        
+        // Skip if cube is entirely inside or outside
+        if (cubeIndex == 0 || cubeIndex == 255)
+            return;
+        
+        // Get vertices positions
+        Vector3[] vertexPositions = new Vector3[8];
+        vertexPositions[0] = new Vector3(x, y, z) * VOXEL_SIZE;
+        vertexPositions[1] = new Vector3(x + stepSize, y, z) * VOXEL_SIZE;
+        vertexPositions[2] = new Vector3(x + stepSize, y, z + stepSize) * VOXEL_SIZE;
+        vertexPositions[3] = new Vector3(x, y, z + stepSize) * VOXEL_SIZE;
+        vertexPositions[4] = new Vector3(x, y + stepSize, z) * VOXEL_SIZE;
+        vertexPositions[5] = new Vector3(x + stepSize, y + stepSize, z) * VOXEL_SIZE;
+        vertexPositions[6] = new Vector3(x + stepSize, y + stepSize, z + stepSize) * VOXEL_SIZE;
+        vertexPositions[7] = new Vector3(x, y + stepSize, z + stepSize) * VOXEL_SIZE;
+        
+        // Find the vertices where the surface intersects the cube
+        Vector3[] vertexList = new Vector3[12];
+        
+        if ((edgeTable[cubeIndex] & 1) != 0)
+            vertexList[0] = VertexInterp(isoLevel, vertexPositions[0], vertexPositions[1], cubeCorners[0], cubeCorners[1]);
+        if ((edgeTable[cubeIndex] & 2) != 0)
+            vertexList[1] = VertexInterp(isoLevel, vertexPositions[1], vertexPositions[2], cubeCorners[1], cubeCorners[2]);
+        if ((edgeTable[cubeIndex] & 4) != 0)
+            vertexList[2] = VertexInterp(isoLevel, vertexPositions[2], vertexPositions[3], cubeCorners[2], cubeCorners[3]);
+        if ((edgeTable[cubeIndex] & 8) != 0)
+            vertexList[3] = VertexInterp(isoLevel, vertexPositions[3], vertexPositions[0], cubeCorners[3], cubeCorners[0]);
+        if ((edgeTable[cubeIndex] & 16) != 0)
+            vertexList[4] = VertexInterp(isoLevel, vertexPositions[4], vertexPositions[5], cubeCorners[4], cubeCorners[5]);
+        if ((edgeTable[cubeIndex] & 32) != 0)
+            vertexList[5] = VertexInterp(isoLevel, vertexPositions[5], vertexPositions[6], cubeCorners[5], cubeCorners[6]);
+        if ((edgeTable[cubeIndex] & 64) != 0)
+            vertexList[6] = VertexInterp(isoLevel, vertexPositions[6], vertexPositions[7], cubeCorners[6], cubeCorners[7]);
+        if ((edgeTable[cubeIndex] & 128) != 0)
+            vertexList[7] = VertexInterp(isoLevel, vertexPositions[7], vertexPositions[4], cubeCorners[7], cubeCorners[4]);
+        if ((edgeTable[cubeIndex] & 256) != 0)
+            vertexList[8] = VertexInterp(isoLevel, vertexPositions[0], vertexPositions[4], cubeCorners[0], cubeCorners[4]);
+        if ((edgeTable[cubeIndex] & 512) != 0)
+            vertexList[9] = VertexInterp(isoLevel, vertexPositions[1], vertexPositions[5], cubeCorners[1], cubeCorners[5]);
+        if ((edgeTable[cubeIndex] & 1024) != 0)
+            vertexList[10] = VertexInterp(isoLevel, vertexPositions[2], vertexPositions[6], cubeCorners[2], cubeCorners[6]);
+        if ((edgeTable[cubeIndex] & 2048) != 0)
+            vertexList[11] = VertexInterp(isoLevel, vertexPositions[3], vertexPositions[7], cubeCorners[3], cubeCorners[7]);
+        
+        // Create triangles
+        for (int i = 0; triTable[cubeIndex, i] != -1; i += 3)
+        {
+            int vertexIndex = vertices.Count;
+            
+            Vector3 v1 = vertexList[triTable[cubeIndex, i]];
+            Vector3 v2 = vertexList[triTable[cubeIndex, i + 1]];
+            Vector3 v3 = vertexList[triTable[cubeIndex, i + 2]];
+            
+            vertices.Add(v1);
+            vertices.Add(v2);
+            vertices.Add(v3);
+            
+            // Calculate normal
+            Vector3 normal = Vector3.Cross(v2 - v1, v3 - v1).normalized;
+            normals.Add(normal);
+            normals.Add(normal);
+            normals.Add(normal);
+            
+            // UVs based on world position
+            uvs.Add(new Vector2(v1.x * 0.1f, v1.z * 0.1f));
+            uvs.Add(new Vector2(v2.x * 0.1f, v2.z * 0.1f));
+            uvs.Add(new Vector2(v3.x * 0.1f, v3.z * 0.1f));
+            
+            triangles.Add(vertexIndex);
+            triangles.Add(vertexIndex + 1);
+            triangles.Add(vertexIndex + 2);
+        }
+    }
+    
+    Vector3 VertexInterp(float isolevel, Vector3 p1, Vector3 p2, float valp1, float valp2)
+    {
+        if (Mathf.Abs(isolevel - valp1) < 0.00001f)
+            return p1;
+        if (Mathf.Abs(isolevel - valp2) < 0.00001f)
+            return p2;
+        if (Mathf.Abs(valp1 - valp2) < 0.00001f)
+            return p1;
+        
+        float mu = (isolevel - valp1) / (valp2 - valp1);
+        return Vector3.Lerp(p1, p2, mu);
+    }
+    
+    float GetVoxelValue(int x, int y, int z)
+    {
+        x = Mathf.Clamp(x, 0, CHUNK_SIZE);
+        y = Mathf.Clamp(y, 0, CHUNK_SIZE);
+        z = Mathf.Clamp(z, 0, CHUNK_SIZE);
+        return voxelData[x, y, z];
+    }
+    
+    void InitializeMarchingCubesTables()
+    {
+        // For testing, use simple voxel rendering instead
+        // In production, implement full marching cubes tables
+    }
+    
+    // Alternative simple voxel mesh generation for testing
+    public void GenerateSimpleVoxelMesh()
+    {
+        vertices.Clear();
+        triangles.Clear();
+        normals.Clear();
+        uvs.Clear();
+        
+        float threshold = 0.5f;
+        
         for (int x = 0; x < CHUNK_SIZE; x++)
         {
             for (int y = 0; y < CHUNK_SIZE; y++)
             {
                 for (int z = 0; z < CHUNK_SIZE; z++)
                 {
-                    if (voxelData[x, y, z] > 0.5f)
+                    if (voxelData[x, y, z] > threshold)
                     {
                         // Check each face
-                        if (!IsVoxelSolid(x - 1, y, z)) // Left face
-                            AddFace(x, y, z, Vector3.left);
-                        if (!IsVoxelSolid(x + 1, y, z)) // Right face
-                            AddFace(x, y, z, Vector3.right);
-                        if (!IsVoxelSolid(x, y - 1, z)) // Bottom face
-                            AddFace(x, y, z, Vector3.down);
-                        if (!IsVoxelSolid(x, y + 1, z)) // Top face
-                            AddFace(x, y, z, Vector3.up);
-                        if (!IsVoxelSolid(x, y, z - 1)) // Back face
-                            AddFace(x, y, z, Vector3.back);
-                        if (!IsVoxelSolid(x, y, z + 1)) // Front face
-                            AddFace(x, y, z, Vector3.forward);
+                        Vector3 pos = new Vector3(x, y, z) * VOXEL_SIZE;
+                        
+                        // Left face (X-)
+                        if (x == 0 || voxelData[x - 1, y, z] <= threshold)
+                            AddQuadFace(pos, Vector3.up * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.left);
+                        
+                        // Right face (X+)
+                        if (x == CHUNK_SIZE - 1 || voxelData[x + 1, y, z] <= threshold)
+                            AddQuadFace(pos + Vector3.right * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.right);
+                        
+                        // Bottom face (Y-)
+                        if (y == 0 || voxelData[x, y - 1, z] <= threshold)
+                            AddQuadFace(pos, Vector3.forward * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.down);
+                        
+                        // Top face (Y+)
+                        if (y == CHUNK_SIZE - 1 || voxelData[x, y + 1, z] <= threshold)
+                            AddQuadFace(pos + Vector3.up * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.up);
+                        
+                        // Back face (Z-)
+                        if (z == 0 || voxelData[x, y, z - 1] <= threshold)
+                            AddQuadFace(pos, Vector3.right * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.back);
+                        
+                        // Front face (Z+)
+                        if (z == CHUNK_SIZE - 1 || voxelData[x, y, z + 1] <= threshold)
+                            AddQuadFace(pos + Vector3.forward * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.forward);
                     }
                 }
             }
         }
+        
+        if (vertices.Count == 0) return;
+        
+        // Create mesh
+        Mesh mesh = new Mesh();
+        mesh.name = "Simple Voxel Mesh";
+        
+        if (vertices.Count > 65535)
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        
+        mesh.vertices = vertices.ToArray();
+        mesh.triangles = triangles.ToArray();
+        mesh.normals = normals.ToArray();
+        mesh.uv = uvs.ToArray();
+        mesh.RecalculateBounds();
+        mesh.Optimize();
+        
+        meshFilter.mesh = mesh;
+        
+        if (meshCollider.enabled && LODLevel == 0)
+            meshCollider.sharedMesh = mesh;
     }
     
-    void GenerateGreedyMesh()
-    {
-        // Process each axis separately (X, Y, Z)
-        for (int axis = 0; axis < 3; axis++)
-        {
-            int axis1 = (axis + 1) % 3;
-            int axis2 = (axis + 2) % 3;
-            
-            int[] dims = { CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE };
-            int[] pos = new int[3];
-            
-            bool[,] mask = new bool[dims[axis1], dims[axis2]];
-            bool[,] maskFlip = new bool[dims[axis1], dims[axis2]];
-            
-            // Process each layer along this axis
-            for (pos[axis] = -1; pos[axis] < dims[axis];)
-            {
-                // Create mask for this layer
-                for (pos[axis1] = 0; pos[axis1] < dims[axis1]; pos[axis1]++)
-                {
-                    for (pos[axis2] = 0; pos[axis2] < dims[axis2]; pos[axis2]++)
-                    {
-                        // Get voxel states
-                        bool voxel1 = IsVoxelSolid(pos[0], pos[1], pos[2]);
-                        bool voxel2 = IsVoxelSolid(
-                            pos[0] + (axis == 0 ? 1 : 0),
-                            pos[1] + (axis == 1 ? 1 : 0),
-                            pos[2] + (axis == 2 ? 1 : 0)
-                        );
-                        
-                        // Create face if there's a solid/air boundary
-                        mask[pos[axis1], pos[axis2]] = voxel1 != voxel2;
-                        
-                        // Track which direction the face should point
-                        // Face points AWAY from solid, INTO air
-                        maskFlip[pos[axis1], pos[axis2]] = voxel1 && !voxel2;
-                    }
-                }
-                
-                pos[axis]++;
-                
-                // Build mesh from mask
-                for (int j = 0; j < dims[axis1]; j++)
-                {
-                    for (int i = 0; i < dims[axis2];)
-                    {
-                        if (!mask[j, i])
-                        {
-                            i++;
-                            continue;
-                        }
-                        
-                        bool flip = maskFlip[j, i];
-                        
-                        // Compute width
-                        int width = 1;
-                        while (i + width < dims[axis2] && mask[j, i + width] && maskFlip[j, i + width] == flip)
-                        {
-                            width++;
-                        }
-                        
-                        // Compute height
-                        int height = 1;
-                        bool done = false;
-                        
-                        while (j + height < dims[axis1] && !done)
-                        {
-                            for (int k = 0; k < width; k++)
-                            {
-                                if (!mask[j + height, i + k] || maskFlip[j + height, i + k] != flip)
-                                {
-                                    done = true;
-                                    break;
-                                }
-                            }
-                            if (!done) height++;
-                        }
-                        
-                        // Add quad
-                        int[] x = new int[3];
-                        x[axis] = pos[axis];
-                        x[axis1] = j;
-                        x[axis2] = i;
-                        
-                        int[] du = new int[3];
-                        du[axis1] = height;
-                        
-                        int[] dv = new int[3];
-                        dv[axis2] = width;
-                        
-                        CreateQuad(x, du, dv, axis, flip);
-                        
-                        // Clear mask area
-                        for (int l = 0; l < height; l++)
-                        {
-                            for (int k = 0; k < width; k++)
-                            {
-                                mask[j + l, i + k] = false;
-                            }
-                        }
-                        
-                        i += width;
-                    }
-                }
-            }
-        }
-    }
-    
-    void CreateQuad(int[] pos, int[] du, int[] dv, int axis, bool flip)
+    void AddQuadFace(Vector3 corner, Vector3 up, Vector3 right, Vector3 normal)
     {
         int vertexIndex = vertices.Count;
         
-        // Create vertices
-        Vector3 v1 = new Vector3(pos[0], pos[1], pos[2]);
-        Vector3 v2 = v1 + new Vector3(du[0], du[1], du[2]);
-        Vector3 v3 = v1 + new Vector3(dv[0], dv[1], dv[2]);
-        Vector3 v4 = v2 + new Vector3(dv[0], dv[1], dv[2]);
+        // Add vertices
+        vertices.Add(corner);
+        vertices.Add(corner + up);
+        vertices.Add(corner + up + right);
+        vertices.Add(corner + right);
         
-        vertices.Add(v1);
-        vertices.Add(v2);
-        vertices.Add(v3);
-        vertices.Add(v4);
+        // Add UVs
+        uvs.Add(new Vector2(0, 0));
+        uvs.Add(new Vector2(0, 1));
+        uvs.Add(new Vector2(1, 1));
+        uvs.Add(new Vector2(1, 0));
         
-        // Calculate normal - points INTO the air (away from solid)
-        Vector3 normal = Vector3.zero;
-        normal[axis] = flip ? 1 : -1;
-        
+        // Add normals
         for (int i = 0; i < 4; i++)
-        {
             normals.Add(normal);
-        }
-        
-        // Add triangles with correct winding
-        if (flip)
-        {
-            // Standard winding
-            triangles.Add(vertexIndex);
-            triangles.Add(vertexIndex + 1);
-            triangles.Add(vertexIndex + 2);
-            triangles.Add(vertexIndex + 1);
-            triangles.Add(vertexIndex + 3);
-            triangles.Add(vertexIndex + 2);
-        }
-        else
-        {
-            // Flipped winding
-            triangles.Add(vertexIndex);
-            triangles.Add(vertexIndex + 2);
-            triangles.Add(vertexIndex + 1);
-            triangles.Add(vertexIndex + 1);
-            triangles.Add(vertexIndex + 2);
-            triangles.Add(vertexIndex + 3);
-        }
-    }
-    
-    void AddFace(int x, int y, int z, Vector3 direction)
-    {
-        int vertexIndex = vertices.Count;
-        Vector3 basePos = new Vector3(x, y, z);
-        
-        if (direction == Vector3.left)
-        {
-            vertices.Add(basePos + new Vector3(0, 0, 0));
-            vertices.Add(basePos + new Vector3(0, 1, 0));
-            vertices.Add(basePos + new Vector3(0, 1, 1));
-            vertices.Add(basePos + new Vector3(0, 0, 1));
-        }
-        else if (direction == Vector3.right)
-        {
-            vertices.Add(basePos + new Vector3(1, 0, 1));
-            vertices.Add(basePos + new Vector3(1, 1, 1));
-            vertices.Add(basePos + new Vector3(1, 1, 0));
-            vertices.Add(basePos + new Vector3(1, 0, 0));
-        }
-        else if (direction == Vector3.down)
-        {
-            vertices.Add(basePos + new Vector3(0, 0, 0));
-            vertices.Add(basePos + new Vector3(0, 0, 1));
-            vertices.Add(basePos + new Vector3(1, 0, 1));
-            vertices.Add(basePos + new Vector3(1, 0, 0));
-        }
-        else if (direction == Vector3.up)
-        {
-            vertices.Add(basePos + new Vector3(0, 1, 1));
-            vertices.Add(basePos + new Vector3(0, 1, 0));
-            vertices.Add(basePos + new Vector3(1, 1, 0));
-            vertices.Add(basePos + new Vector3(1, 1, 1));
-        }
-        else if (direction == Vector3.back)
-        {
-            vertices.Add(basePos + new Vector3(1, 0, 0));
-            vertices.Add(basePos + new Vector3(1, 1, 0));
-            vertices.Add(basePos + new Vector3(0, 1, 0));
-            vertices.Add(basePos + new Vector3(0, 0, 0));
-        }
-        else if (direction == Vector3.forward)
-        {
-            vertices.Add(basePos + new Vector3(0, 0, 1));
-            vertices.Add(basePos + new Vector3(0, 1, 1));
-            vertices.Add(basePos + new Vector3(1, 1, 1));
-            vertices.Add(basePos + new Vector3(1, 0, 1));
-        }
         
         // Add triangles
         triangles.Add(vertexIndex);
         triangles.Add(vertexIndex + 1);
         triangles.Add(vertexIndex + 2);
+        
         triangles.Add(vertexIndex);
         triangles.Add(vertexIndex + 2);
         triangles.Add(vertexIndex + 3);
-        
-        // Add normals
-        for (int i = 0; i < 4; i++)
-        {
-            normals.Add(direction);
-        }
-    }
-    
-    bool IsVoxelSolid(int x, int y, int z)
-    {
-        if (x < 0 || x >= CHUNK_SIZE || y < 0 || y >= CHUNK_SIZE || z < 0 || z >= CHUNK_SIZE)
-            return false;
-            
-        return voxelData[x, y, z] > 0.5f;
-    }
-    
-    public float GetVoxel(int x, int y, int z)
-    {
-        if (x < 0 || x >= CHUNK_SIZE || y < 0 || y >= CHUNK_SIZE || z < 0 || z >= CHUNK_SIZE)
-            return 0f;
-            
-        return voxelData[x, y, z];
     }
 }

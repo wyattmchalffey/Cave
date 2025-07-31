@@ -5,126 +5,208 @@ using Unity.Mathematics;
 using UnityEngine;
 
 [BurstCompile(CompileSynchronously = true)]
-public struct CaveGenerationJob : IJob
+public struct CaveGenerationJob : IJobParallelFor
 {
     // Input
     [ReadOnly] public float3 chunkWorldPosition;
     [ReadOnly] public int chunkSize;
+    [ReadOnly] public float voxelSize;
     [ReadOnly] public CaveSettings settings;
+    [ReadOnly] public NativeArray<float3> chamberCenters;
+    
+    // Flattened tunnel data to avoid nested containers
+    [ReadOnly] public NativeArray<float3> allTunnelPoints; // All tunnel control points flattened
+    [ReadOnly] public NativeArray<int> tunnelPointCounts; // Number of points per tunnel
+    [ReadOnly] public NativeArray<int> tunnelStartIndices; // Start index in allTunnelPoints for each tunnel
+    [ReadOnly] public NativeArray<float> tunnelRadii; // Radius for each tunnel
     
     // Output
+    [NativeDisableParallelForRestriction]
     public NativeArray<float> voxelData;
     
-    public void Execute()
+    public void Execute(int index)
     {
-        int index = 0;
+        // Convert linear index to 3D coordinates
+        int sizeWithBoundary = chunkSize + 1;
+        int x = index % sizeWithBoundary;
+        int y = (index / sizeWithBoundary) % sizeWithBoundary;
+        int z = index / (sizeWithBoundary * sizeWithBoundary);
         
-        for (int x = 0; x < chunkSize; x++)
-        {
-            for (int y = 0; y < chunkSize; y++)
-            {
-                for (int z = 0; z < chunkSize; z++)
-                {
-                    float3 worldPos = chunkWorldPosition + new float3(x, y, z);
-                    float density = GenerateCaveDensity(worldPos);
-                    voxelData[index++] = density;
-                }
-            }
-        }
+        float3 localPos = new float3(x, y, z) * voxelSize;
+        float3 worldPos = chunkWorldPosition + localPos;
+        
+        float density = GenerateImprovedCaveDensity(worldPos);
+        voxelData[index] = density;
     }
     
-    float GenerateCaveDensity(float3 worldPos)
+    float GenerateImprovedCaveDensity(float3 worldPos)
     {
-        // Base cave noise - larger scale for bigger caves
-        float caveNoise = SampleNoise3D(
-            worldPos * settings.baseFrequency,
-            settings.octaves,
-            settings.persistence,
-            settings.lacunarity,
-            settings.noiseOffset
+        // Start with solid rock
+        float density = 1.0f;
+        
+        // Skip if outside cave height range
+        if (worldPos.y < settings.minCaveHeight || worldPos.y > settings.maxCaveHeight)
+            return density;
+        
+        // Surface transition
+        if (worldPos.y > settings.surfaceTransitionHeight)
+        {
+            float transition = (worldPos.y - settings.surfaceTransitionHeight) / 10f;
+            density = math.lerp(density, 0f, math.saturate(transition));
+        }
+        
+        // 1. Chamber generation
+        float chamberInfluence = EvaluateChambers(worldPos);
+        
+        // 2. Tunnel network
+        float tunnelInfluence = EvaluateTunnels(worldPos);
+        
+        // 3. Geological stratification
+        float stratification = EvaluateStratification(worldPos);
+        
+        // 4. Detail noise for natural variation
+        float detailNoise = SampleDetailNoise(worldPos);
+        
+        // Combine influences
+        float caveDensity = math.min(chamberInfluence, tunnelInfluence);
+        caveDensity += stratification + detailNoise;
+        
+        // Apply erosion
+        caveDensity = ApplyErosion(worldPos, caveDensity);
+        
+        return caveDensity;
+    }
+    
+    float EvaluateChambers(float3 worldPos)
+    {
+        if (chamberCenters.Length == 0) return 1f;
+        
+        float minDistance = float.MaxValue;
+        float3 nearestChamber = float3.zero;
+        
+        // Find nearest chamber
+        for (int i = 0; i < chamberCenters.Length; i++)
+        {
+            float3 chamberPos = chamberCenters[i];
+            
+            // Apply vertical scaling to make chambers more horizontal
+            float3 scaledDiff = worldPos - chamberPos;
+            scaledDiff.y *= 1f / settings.chamberVerticalScale;
+            
+            float distance = math.length(scaledDiff);
+            if (distance < minDistance)
+            {
+                minDistance = distance;
+                nearestChamber = chamberPos;
+            }
+        }
+        
+        // Calculate chamber influence with flat floors
+        float chamberRadius = math.lerp(settings.chamberMinRadius, settings.chamberMaxRadius, 
+            Hash(nearestChamber) * 0.5f + 0.5f);
+        
+        // Create flat floor effect
+        float heightInChamber = worldPos.y - nearestChamber.y;
+        float floorDistance = 0f;
+        
+        if (heightInChamber < 0)
+        {
+            // Below chamber center - create flat floor
+            float floorY = nearestChamber.y - chamberRadius * 0.3f;
+            floorDistance = math.abs(worldPos.y - floorY) * settings.chamberFloorFlatness;
+        }
+        
+        // Chamber shape function
+        float chamberDensity = (minDistance + floorDistance) / chamberRadius - 1f;
+        
+        // Smooth edges
+        return math.smoothstep(-0.1f, 0.1f, chamberDensity);
+    }
+    
+    float EvaluateTunnels(float3 worldPos)
+    {
+        if (tunnelPointCounts.Length == 0) return 1f;
+        
+        float minDistance = float.MaxValue;
+        
+        // Find distance to nearest tunnel
+        for (int tunnelIdx = 0; tunnelIdx < tunnelPointCounts.Length; tunnelIdx++)
+        {
+            float distance = DistanceToTunnel(worldPos, tunnelIdx);
+            minDistance = math.min(minDistance, distance);
+        }
+        
+        // Tunnel radius with variation
+        float tunnelRadius = math.lerp(settings.tunnelMinRadius, settings.tunnelMaxRadius,
+            SampleNoise3D(worldPos * 0.1f, 1, 0.5f, 2f, settings.noiseOffset));
+        
+        // Tunnel shape function
+        float tunnelDensity = minDistance / tunnelRadius - 1f;
+        
+        return math.smoothstep(-0.1f, 0.1f, tunnelDensity);
+    }
+    
+    float DistanceToTunnel(float3 point, int tunnelIndex)
+    {
+        int startIdx = tunnelStartIndices[tunnelIndex];
+        int pointCount = tunnelPointCounts[tunnelIndex];
+        float minDist = float.MaxValue;
+        
+        // Check each segment of the tunnel
+        for (int i = 0; i < pointCount - 1; i++)
+        {
+            float3 p0 = allTunnelPoints[startIdx + i];
+            float3 p1 = allTunnelPoints[startIdx + i + 1];
+            
+            // Distance to line segment
+            float3 line = p1 - p0;
+            float t = math.clamp(math.dot(point - p0, line) / math.dot(line, line), 0f, 1f);
+            float3 closest = p0 + t * line;
+            
+            float dist = math.distance(point, closest);
+            minDist = math.min(minDist, dist);
+        }
+        
+        return minDist;
+    }
+    
+    float EvaluateStratification(float3 worldPos)
+    {
+        // Geological layer influence
+        float layerPattern = math.sin(worldPos.y * settings.stratificationFrequency * math.PI);
+        float stratification = layerPattern * settings.stratificationStrength;
+        
+        // Add some horizontal variation
+        float horizontalVariation = SampleNoise3D(
+            new float3(worldPos.x, 0, worldPos.z) * 0.02f,
+            2, 0.5f, 2f, settings.noiseOffset + new float3(100, 0, 100)
+        ) * 0.1f;
+        
+        return stratification + horizontalVariation;
+    }
+    
+    float ApplyErosion(float3 worldPos, float baseDensity)
+    {
+        // Simulate water erosion effects
+        float erosionNoise = SampleNoise3D(
+            worldPos * 0.05f,
+            3, 0.6f, 2f,
+            settings.noiseOffset + new float3(200, 200, 200)
         );
         
-        // Start with solid
-        float density = 1f;
+        // Erosion is stronger in softer rock and lower areas
+        float heightFactor = 1f - math.saturate((worldPos.y - settings.minCaveHeight) / 50f);
+        float erosion = erosionNoise * settings.erosionStrength * heightFactor * (1f - settings.rockHardness);
         
-        // Carve out base caves
-        if (caveNoise > settings.caveThreshold)
-        {
-            density = 0f;
-        }
-        
-        // Add large caverns using multiple noise layers
-        if (settings.enableCaverns)
-        {
-            // Large scale caverns
-            float cavernNoise1 = SampleNoise3D(
-                worldPos * settings.cavernScale,
-                2,
-                0.5f,
-                2f,
-                settings.noiseOffset + new float3(100, 100, 100)
-            );
-            
-            // Medium scale variation
-            float cavernNoise2 = SampleNoise3D(
-                worldPos * (settings.cavernScale * 2f),
-                2,
-                0.5f,
-                2f,
-                settings.noiseOffset + new float3(200, 200, 200)
-            );
-            
-            // Combine for more interesting shapes
-            float cavernValue = cavernNoise1 * cavernNoise2;
-            
-            // Create large caverns where combined noise is high
-            if (cavernValue > settings.cavernThreshold * settings.cavernThreshold)
-            {
-                density = 0f;
-            }
-        }
-        
-        // Add tunnels that connect caves
-        if (settings.enableTunnels && density > 0.5f)
-        {
-            // Create 3D worm tunnels
-            float tunnel1 = SampleNoise3D(
-                worldPos * settings.tunnelFrequency,
-                2,
-                0.4f,
-                2f,
-                settings.tunnelOffset
-            );
-            
-            float tunnel2 = SampleNoise3D(
-                worldPos * settings.tunnelFrequency * 1.5f,
-                2,
-                0.4f,
-                2f,
-                settings.tunnelOffset + new float3(500, 500, 500)
-            );
-            
-            // Worm-like tunnels using ridge noise
-            float ridgeNoise1 = math.abs(tunnel1 - 0.5f);
-            float ridgeNoise2 = math.abs(tunnel2 - 0.5f);
-            
-            // Wider tunnels for better connectivity
-            if (ridgeNoise1 < settings.tunnelWidth || ridgeNoise2 < settings.tunnelWidth)
-            {
-                density = 0f;
-            }
-        }
-        
-        // Height-based modifications
-        if (worldPos.y > 40f)
-        {
-            density = 1f; // Force solid high up
-        }
-        
-        return density;
+        return baseDensity - erosion;
     }
     
-    // Optimized 3D noise function
+    float SampleDetailNoise(float3 worldPos)
+    {
+        // High-frequency detail noise
+        return SampleNoise3D(worldPos * 0.1f, 2, 0.5f, 2f, settings.noiseOffset + new float3(300, 300, 300)) * 0.05f;
+    }
+    
     float SampleNoise3D(float3 pos, int octaves, float persistence, float lacunarity, float3 offset)
     {
         pos += offset;
@@ -142,63 +224,25 @@ public struct CaveGenerationJob : IJob
             frequency *= lacunarity;
         }
         
-        return noiseValue / maxValue;
+        return (noiseValue / maxValue) * 2f - 1f; // Return -1 to 1
     }
     
-    // Fast 3D Perlin noise approximation
     float Perlin3D(float3 pos)
     {
-        // Using Unity.Mathematics noise functions
         float xy = noise.cnoise(new float2(pos.x, pos.y));
         float xz = noise.cnoise(new float2(pos.x, pos.z));
         float yz = noise.cnoise(new float2(pos.y, pos.z));
+        float yx = noise.cnoise(new float2(pos.y, pos.x));
+        float zx = noise.cnoise(new float2(pos.z, pos.x));
+        float zy = noise.cnoise(new float2(pos.z, pos.y));
         
-        // Combine for 3D effect
-        return (xy + xz + yz + 1.5f) / 3f; // Normalized to 0-1
+        return (xy + xz + yz + yx + zx + zy) / 6f;
     }
-}
-
-[System.Serializable]
-public struct CaveSettings
-{
-    [Header("Base Cave Settings")]
-    public float baseFrequency;
-    public int octaves;
-    public float persistence;
-    public float lacunarity;
-    public float caveThreshold;
-    public float3 noiseOffset;
     
-    [Header("Tunnel Settings")]
-    public bool enableTunnels;
-    public float tunnelFrequency;
-    public float tunnelWidth;
-    public float3 tunnelOffset;
-    
-    [Header("Cavern Settings")]
-    public bool enableCaverns;
-    public float cavernThreshold;
-    public float cavernScale;
-    
-    public static CaveSettings Default()
+    float Hash(float3 p)
     {
-        return new CaveSettings
-        {
-            baseFrequency = 0.05f,
-            octaves = 3,
-            persistence = 0.5f,
-            lacunarity = 2f,
-            caveThreshold = 0.5f,
-            noiseOffset = new float3(0, 0, 0),
-            
-            enableTunnels = true,
-            tunnelFrequency = 0.03f,
-            tunnelWidth = 0.15f,
-            tunnelOffset = new float3(1000, 1000, 1000),
-            
-            enableCaverns = true,
-            cavernThreshold = 0.7f,
-            cavernScale = 0.01f
-        };
+        p = math.frac(p * 0.3183099f + 0.1f);
+        p *= 17.0f;
+        return math.frac(p.x * p.y * p.z * (p.x + p.y + p.z));
     }
 }
