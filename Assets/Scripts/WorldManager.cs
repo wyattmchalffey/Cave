@@ -9,6 +9,7 @@ public class WorldManager : MonoBehaviour
     [Header("World Settings")]
     public Transform player;
     public int viewDistance = 5;
+    public int unloadDistance = 2; // Extra buffer before unloading chunks
     public int chunksPerFrame = 2;
     
     [Header("Cave Settings")]
@@ -109,20 +110,25 @@ public class WorldManager : MonoBehaviour
                 {
                     Vector3Int chunkCoord = playerChunkCoord + new Vector3Int(x, y, z);
                     
-                    if (!activeChunks.ContainsKey(chunkCoord) && !IsChunkQueued(chunkCoord))
+                    // Only load chunks within view distance
+                    if (Vector3Int.Distance(chunkCoord, playerChunkCoord) <= viewDistance)
                     {
-                        chunkGenerationQueue.Enqueue(chunkCoord);
+                        if (!activeChunks.ContainsKey(chunkCoord) && !IsChunkQueued(chunkCoord))
+                        {
+                            chunkGenerationQueue.Enqueue(chunkCoord);
+                        }
                     }
                 }
             }
         }
         
-        // Unload distant chunks
+        // Unload distant chunks with buffer zone
         List<Vector3Int> chunksToUnload = new List<Vector3Int>();
         foreach (var kvp in activeChunks)
         {
             float distance = Vector3Int.Distance(kvp.Key, playerChunkCoord);
-            if (distance > viewDistance + 2)
+            // Only unload if beyond view distance + buffer
+            if (distance > viewDistance + unloadDistance)
             {
                 chunksToUnload.Add(kvp.Key);
             }
@@ -295,8 +301,8 @@ public class WorldManager : MonoBehaviour
         
         Vector3Int playerChunk = WorldToChunkCoordinate(player.position);
         
-        // Draw view distance
-        Gizmos.color = Color.yellow;
+        // Draw view distance (green)
+        Gizmos.color = Color.green;
         Vector3 center = new Vector3(
             playerChunk.x * Chunk.CHUNK_SIZE + Chunk.CHUNK_SIZE / 2f,
             playerChunk.y * Chunk.CHUNK_SIZE + Chunk.CHUNK_SIZE / 2f,
@@ -306,6 +312,13 @@ public class WorldManager : MonoBehaviour
         Gizmos.DrawWireCube(
             center,
             Vector3.one * Chunk.CHUNK_SIZE * (viewDistance * 2 + 1)
+        );
+        
+        // Draw unload distance (red)
+        Gizmos.color = Color.red;
+        Gizmos.DrawWireCube(
+            center,
+            Vector3.one * Chunk.CHUNK_SIZE * ((viewDistance + unloadDistance) * 2 + 1)
         );
     }
 }
