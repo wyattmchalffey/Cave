@@ -109,7 +109,7 @@ public partial class WorldManager : MonoBehaviour
         chamberCenters = networkPreprocessor.chamberCenters;
         tunnelNetwork = networkPreprocessor.tunnelNetwork;
         
-        Debug.Log($"Generated cave network with {chamberCenters.Length} chambers and {tunnelNetwork.Count} tunnels");
+        UnityEngine.Debug.Log($"Generated cave network with {chamberCenters.Length} chambers and {tunnelNetwork.Count} tunnels");
     }
     
     void PrewarmChunkPool(int count)
@@ -147,51 +147,39 @@ public partial class WorldManager : MonoBehaviour
         // Queue chunks that need to be loaded
         for (int x = -lodDistance; x <= lodDistance; x++)
         {
-            for (int y = -lodDistance; y <= lodDistance; y++)
+            for (int y = -viewDistance; y <= viewDistance; y++)
             {
                 for (int z = -lodDistance; z <= lodDistance; z++)
                 {
                     Vector3Int chunkCoord = playerChunkCoord + new Vector3Int(x, y, z);
-                    float distance = Vector3Int.Distance(chunkCoord, playerChunkCoord);
+                    float distance = Vector3.Distance(
+                        new Vector3(x, y, z), 
+                        Vector3.zero
+                    );
                     
-                    if (distance <= lodDistance)
+                    // Skip if too far
+                    if (distance > lodDistance) continue;
+                    
+                    // Skip if already loaded or queued
+                    if (activeChunks.ContainsKey(chunkCoord) || IsChunkQueued(chunkCoord))
+                        continue;
+                    
+                    // Determine LOD level
+                    int lodLevel = 0;
+                    if (enableLOD)
                     {
-                        // Determine LOD level based on distance
-                        int lodLevel = 0;
-                        if (enableLOD)
-                        {
-                            if (distance > viewDistance)
-                                lodLevel = 1;
-                            if (distance > viewDistance * 1.5f)
-                                lodLevel = 2;
-                        }
-                        
-                        // Check if chunk needs to be loaded or LOD updated
-                        if (!activeChunks.ContainsKey(chunkCoord))
-                        {
-                            if (!IsChunkQueued(chunkCoord))
-                            {
-                                chunkGenerationQueue.Enqueue(new ChunkGenerationRequest
-                                {
-                                    coordinate = chunkCoord,
-                                    lodLevel = lodLevel
-                                });
-                            }
-                        }
-                        else if (activeChunks.TryGetValue(chunkCoord, out var chunk))
-                        {
-                            // Update LOD if needed
-                            if (chunk.LODLevel != lodLevel)
-                            {
-                                // Re-generate at new LOD level
-                                chunkGenerationQueue.Enqueue(new ChunkGenerationRequest
-                                {
-                                    coordinate = chunkCoord,
-                                    lodLevel = lodLevel
-                                });
-                            }
-                        }
+                        if (distance > viewDistance)
+                            lodLevel = 1;
+                        if (distance > viewDistance * 1.5f)
+                            lodLevel = 2;
                     }
+                    
+                    // Queue for generation
+                    chunkGenerationQueue.Enqueue(new ChunkGenerationRequest
+                    {
+                        coordinate = chunkCoord,
+                        lodLevel = lodLevel
+                    });
                 }
             }
         }
@@ -286,7 +274,7 @@ public partial class WorldManager : MonoBehaviour
         }
         else
         {
-            // Empty arrays if no tunnels
+            // Empty arrays
             allTunnelPoints = new NativeArray<float3>(0, Allocator.TempJob);
             tunnelPointCounts = new NativeArray<int>(0, Allocator.TempJob);
             tunnelStartIndices = new NativeArray<int>(0, Allocator.TempJob);
@@ -294,7 +282,7 @@ public partial class WorldManager : MonoBehaviour
         }
         
         // Create and schedule job
-        CaveGenerationJob job = new CaveGenerationJob
+        var job = new CaveGenerationJob
         {
             chunkWorldPosition = new float3(
                 request.coordinate.x * Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE,
@@ -440,6 +428,89 @@ public partial class WorldManager : MonoBehaviour
                 totalVertices += meshFilter.mesh.vertexCount;
             }
         }
+    }
+    
+    // GPU Generation Methods
+    void InitializeGPU()
+    {
+        if (gpuChunkManager == null)
+        {
+            UnityEngine.Debug.LogError("GPU Chunk Manager not assigned to WorldManager!");
+            return;
+        }
+        
+        // Initialize the GPU chunk manager if it has specific initialization needs
+        // The GPUChunkManager's Start() method already handles initialization,
+        // but you can add any additional setup here if needed
+        
+        UnityEngine.Debug.Log("GPU acceleration initialized for cave generation");
+    }
+    
+    void StartGPUChunkGeneration(ChunkGenerationRequest request)
+    {
+        if (!useGPUGeneration || gpuChunkManager == null)
+        {
+            UnityEngine.Debug.LogWarning("GPU generation requested but not available");
+            return;
+        }
+        
+        // Convert the chunk generation request to GPU chunk request format
+        GPUChunkManager.GPUChunkRequest gpuRequest = new GPUChunkManager.GPUChunkRequest
+        {
+            coordinate = request.coordinate,
+            lodLevel = request.lodLevel,
+            onComplete = (meshData) => OnGPUChunkComplete(request.coordinate, meshData, request.lodLevel)
+        };
+        
+        // Submit the request to the GPU chunk manager
+        gpuChunkManager.RequestChunk(gpuRequest);
+    }
+    
+    void OnGPUChunkComplete(Vector3Int coordinate, GPUChunkManager.ChunkMeshData meshData, int lodLevel)
+    {
+        // Get or create the chunk
+        Chunk chunk = GetOrCreateChunk(coordinate, lodLevel);
+        
+        if (chunk != null && meshData.vertices.Length > 0)
+        {
+            // Get the mesh filter component
+            MeshFilter chunkMeshFilter = chunk.GetComponent<MeshFilter>();
+            if (chunkMeshFilter != null)
+            {
+                // Create or get mesh
+                if (chunkMeshFilter.mesh == null)
+                {
+                    chunkMeshFilter.mesh = new Mesh();
+                    chunkMeshFilter.mesh.name = $"Chunk_{coordinate}";
+                }
+                
+                // Apply the mesh data to the chunk
+                chunkMeshFilter.mesh.Clear();
+                chunkMeshFilter.mesh.vertices = meshData.vertices;
+                chunkMeshFilter.mesh.triangles = meshData.triangles;
+                chunkMeshFilter.mesh.normals = meshData.normals;
+                chunkMeshFilter.mesh.uv = meshData.uvs;
+                chunkMeshFilter.mesh.RecalculateBounds();
+            }
+            
+            // Update statistics
+            totalVertices += meshData.vertices.Length;
+        }
+    }
+    
+    Chunk GetOrCreateChunk(Vector3Int coordinate, int lodLevel)
+    {
+        if (activeChunks.TryGetValue(coordinate, out Chunk existingChunk))
+        {
+            return existingChunk;
+        }
+        
+        // Get chunk from pool or create new
+        Chunk chunk = GetPooledChunk();
+        chunk.Initialize(coordinate, caveMaterial, lodLevel);
+        activeChunks[coordinate] = chunk;
+        
+        return chunk;
     }
     
     void OnDestroy()
