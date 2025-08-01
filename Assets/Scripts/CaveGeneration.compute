@@ -3,7 +3,7 @@
 #pragma kernel GenerateTunnelField
 
 // Constants
-static const int CHUNK_SIZE = 32;
+static const uint CHUNK_SIZE = 32;
 static const float VOXEL_SIZE = 0.25;
 
 // Input parameters
@@ -49,13 +49,12 @@ float noise3D(float3 p)
     );
 }
 
-float worleyNoise3D(float3 p, out float3 closestPoint)
+float worleyNoise3D(float3 p)
 {
     float3 cell = floor(p);
     float3 localPos = frac(p);
     
     float minDist = 10.0;
-    closestPoint = p;
     
     // Check neighboring cells
     for (int x = -1; x <= 1; x++)
@@ -64,14 +63,13 @@ float worleyNoise3D(float3 p, out float3 closestPoint)
         {
             for (int z = -1; z <= 1; z++)
             {
-                float3 neighbor = cell + float3(x, y, z);
-                float3 point = neighbor + hash(neighbor);
-                float dist = distance(p, point);
+                float3 neighbor = cell + float3(float(x), float(y), float(z));
+                float3 randomPoint = neighbor + frac(float3(hash(neighbor), hash(neighbor + 1.0), hash(neighbor + 2.0)));
+                float dist = length(p - randomPoint);
                 
                 if (dist < minDist)
                 {
                     minDist = dist;
-                    closestPoint = point;
                 }
             }
         }
@@ -82,6 +80,9 @@ float worleyNoise3D(float3 p, out float3 closestPoint)
 
 float evaluateChambers(float3 worldPos)
 {
+    if (ChamberCount == 0)
+        return 1.0; // No chambers, return solid
+        
     float minDistance = 1000000.0;
     float3 nearestChamber = float3(0, 0, 0);
     int nearestIndex = 0;
@@ -93,7 +94,7 @@ float evaluateChambers(float3 worldPos)
         
         // Apply vertical scaling
         float3 scaledDiff = worldPos - chamberPos;
-        scaledDiff.y *= 1.0 / CaveSettings1.w; // chamberVerticalScale
+        scaledDiff.y *= 2.0; // Make chambers flatter
         
         float distance = length(scaledDiff);
         if (distance < minDistance)
@@ -104,9 +105,9 @@ float evaluateChambers(float3 worldPos)
         }
     }
     
-    // Calculate chamber radius
+    // Calculate chamber radius (use chamber index for variation)
     float chamberRadius = lerp(CaveSettings1.y, CaveSettings1.z, 
-        hash(nearestChamber) * 0.5 + 0.5);
+        frac(float(nearestIndex) * 0.31415926));
     
     // Create flat floor effect
     float heightInChamber = worldPos.y - nearestChamber.y;
@@ -226,4 +227,44 @@ void GenerateTunnelField(uint3 id : SV_DispatchThreadID)
     // For now, just pass through
     
     DensityField[index] = density;
+}
+
+#pragma kernel DebugDensityField
+
+[numthreads(8, 8, 8)]
+void DebugDensityField(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (id.x >= CHUNK_SIZE + 1 || id.y >= CHUNK_SIZE + 1 || id.z >= CHUNK_SIZE + 1)
+        return;
+    
+    // Calculate world position
+    float3 localPos = float3(id.x, id.y, id.z) * VOXEL_SIZE;
+    float3 worldPos = ChunkOrigin + localPos;
+    
+    // Create a simple test pattern
+    float density = 1.0; // Start solid
+    
+    // Create a sphere of air in the center of each chunk
+    float3 chunkCenter = ChunkOrigin + float3(4.0, 4.0, 4.0);
+    float distToCenter = length(worldPos - chunkCenter);
+    
+    if (distToCenter < 3.0)
+    {
+        density = -1.0; // Air
+    }
+    else if (distToCenter < 4.0)
+    {
+        // Smooth transition
+        density = (distToCenter - 3.0) / 1.0;
+    }
+    
+    // Also create a horizontal slice of air
+    if (worldPos.y > -10.0 && worldPos.y < 10.0)
+    {
+        density = min(density, (abs(worldPos.y) - 5.0) / 5.0);
+    }
+    
+    // Write to buffer
+    DensityField[id.x + id.y * (CHUNK_SIZE + 1) + id.z * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1)] = density;
 }
