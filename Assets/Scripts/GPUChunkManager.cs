@@ -233,7 +233,7 @@ public class GPUChunkManager : MonoBehaviour
         caveGenerationShader.Dispatch(kernelToUse, threadGroups, threadGroups, threadGroups);
         
         // Wait for GPU
-        yield return new WaitForEndOfFrame();
+        // yield return new WaitForEndOfFrame();
         
         // Read back density data
         float[] densityData = new float[(CHUNK_SIZE + 1) * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1)];
