@@ -1,0 +1,328 @@
+#pragma kernel GenerateNoiseField
+#pragma kernel GenerateNoisePreview
+
+// Constants
+static const uint CHUNK_SIZE = 32;
+static const float VOXEL_SIZE = 0.25;
+static const int MAX_LAYERS = 16;
+
+// Noise layer data
+struct NoiseLayer
+{
+    int enabled;
+    int noiseType; // 0=Perlin, 1=Simplex, 2=Worley, 3=Ridged, 4=Cavern
+    int blendMode; // 0=Add, 1=Subtract, 2=Multiply, 3=Min, 4=Max, 5=Override
+    float frequency;
+    float amplitude;
+    int octaves;
+    float persistence;
+    float lacunarity;
+    float3 offset;
+    float verticalSquash;
+    float densityBias;
+    float power;
+    float minHeight;
+    float maxHeight;
+    int useHeightConstraints;
+    float _padding; // Align to 16 bytes
+};
+
+// Input
+float3 ChunkOrigin;
+int LayerCount;
+StructuredBuffer<NoiseLayer> Layers;
+StructuredBuffer<float3> ChamberCenters;
+int ChamberCount;
+
+// Output
+RWStructuredBuffer<float> DensityField;
+RWTexture2D<float4> PreviewTexture;
+
+// Noise functions
+float hash(float3 p)
+{
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float3 hash3(float3 p)
+{
+    p = frac(p * float3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return frac((p.xxy + p.yxx) * p.zyx);
+}
+
+// 3D Perlin noise
+float perlin3D(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    
+    float a = hash(i);
+    float b = hash(i + float3(1, 0, 0));
+    float c = hash(i + float3(0, 1, 0));
+    float d = hash(i + float3(1, 1, 0));
+    float e = hash(i + float3(0, 0, 1));
+    float f1 = hash(i + float3(1, 0, 1));
+    float g = hash(i + float3(0, 1, 1));
+    float h = hash(i + float3(1, 1, 1));
+    
+    float x1 = lerp(a, b, f.x);
+    float x2 = lerp(c, d, f.x);
+    float x3 = lerp(e, f1, f.x);
+    float x4 = lerp(g, h, f.x);
+    
+    float y1 = lerp(x1, x2, f.y);
+    float y2 = lerp(x3, x4, f.y);
+    
+    return lerp(y1, y2, f.z) * 2.0 - 1.0;
+}
+
+// Simplex noise (simplified version)
+float simplex3D(float3 p)
+{
+    // Using a simplified version that's similar to perlin but smoother
+    float3 i = floor(p + (p.x + p.y + p.z) * 0.333333);
+    float3 x0 = p - i + (i.x + i.y + i.z) * 0.166667;
+    
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1.0 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+    
+    float3 x1 = x0 - i1 + 0.166667;
+    float3 x2 = x0 - i2 + 0.333333;
+    float3 x3 = x0 - 0.5;
+    
+    float4 w = float4(
+        dot(x0, x0),
+        dot(x1, x1),
+        dot(x2, x2),
+        dot(x3, x3)
+    );
+    
+    w = max(0.6 - w, 0.0);
+    w = w * w * w * w;
+    
+    float4 d = float4(
+        hash(i),
+        hash(i + i1),
+        hash(i + i2),
+        hash(i + 1.0)
+    );
+    
+    return dot(w, d * 2.0 - 1.0) * 32.0;
+}
+
+// Worley noise
+float worley3D(float3 p, float freq)
+{
+    float3 cell = floor(p * freq);
+    float3 localPos = frac(p * freq);
+    
+    float minDist = 1.0;
+    
+    for (int x = -1; x <= 1; x++)
+    {
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int z = -1; z <= 1; z++)
+            {
+                float3 neighbor = cell + float3(x, y, z);
+                float3 randomPoint = neighbor + hash3(neighbor) * 0.5 + 0.25;
+                float dist = length(p * freq - randomPoint);
+                minDist = min(minDist, dist);
+            }
+        }
+    }
+    
+    return 1.0 - minDist;
+}
+
+// Ridged noise
+float ridged3D(float3 p)
+{
+    float n = 1.0 - abs(perlin3D(p));
+    return n * n;
+}
+
+// Sample a single layer
+float sampleLayer(NoiseLayer layer, float3 pos)
+{
+    // Apply vertical squash
+    float3 samplePos = pos;
+    samplePos.y *= 1.0 / max(0.01, layer.verticalSquash);
+    samplePos += layer.offset;
+    
+    float value = 0.0;
+    float amplitude = 1.0;
+    float frequency = layer.frequency;
+    float maxValue = 0.0;
+    
+    // Base noise based on type
+    if (layer.noiseType == 0) // Perlin
+    {
+        for (int i = 0; i < layer.octaves; i++)
+        {
+            value += perlin3D(samplePos * frequency) * amplitude;
+            maxValue += amplitude;
+            amplitude *= layer.persistence;
+            frequency *= layer.lacunarity;
+        }
+        value /= maxValue;
+    }
+    else if (layer.noiseType == 1) // Simplex
+    {
+        for (int i = 0; i < layer.octaves; i++)
+        {
+            value += simplex3D(samplePos * frequency) * amplitude;
+            maxValue += amplitude;
+            amplitude *= layer.persistence;
+            frequency *= layer.lacunarity;
+        }
+        value /= maxValue;
+    }
+    else if (layer.noiseType == 2) // Worley
+    {
+        value = worley3D(samplePos, layer.frequency);
+    }
+    else if (layer.noiseType == 3) // Ridged
+    {
+        for (int i = 0; i < layer.octaves; i++)
+        {
+            float r = ridged3D(samplePos * frequency);
+            value += r * amplitude;
+            maxValue += amplitude;
+            amplitude *= layer.persistence;
+            frequency *= layer.lacunarity;
+        }
+        value /= maxValue;
+    }
+    else if (layer.noiseType == 4) // Cavern
+    {
+        // Special cavern generation
+        float worley1 = worley3D(samplePos, layer.frequency * 0.5);
+        float worley2 = worley3D(samplePos, layer.frequency * 1.5);
+        float perlin = perlin3D(samplePos * layer.frequency * 2.0) * 0.5 + 0.5;
+        
+        value = worley1 * worley2;
+        value = value * value;
+        value += perlin * 0.1;
+        
+        // Chamber carving if available
+        if (ChamberCount > 0)
+        {
+            float minChamberDist = 1000000.0;
+            for (int j = 0; j < ChamberCount; j++)
+            {
+                float3 diff = pos - ChamberCenters[j];
+                diff.y *= 2.0; // Vertical squash for chambers
+                float dist = length(diff);
+                minChamberDist = min(minChamberDist, dist);
+            }
+            
+            float chamberRadius = 20.0; // Should come from settings
+            float chamberInfluence = saturate(1.0 - minChamberDist / chamberRadius);
+            chamberInfluence = smoothstep(0.0, 1.0, chamberInfluence);
+            value = min(value, 1.0 - chamberInfluence);
+        }
+        
+        value = value * 2.0 - 1.0;
+    }
+    
+    // Apply power curve
+    if (layer.power != 1.0)
+    {
+        value = sign(value) * pow(abs(value), layer.power);
+    }
+    
+    // Apply density bias
+    value += layer.densityBias;
+    
+    // Apply height constraints
+    if (layer.useHeightConstraints)
+    {
+        float heightNorm = saturate((pos.y - layer.minHeight) / (layer.maxHeight - layer.minHeight));
+        // Simple linear falloff - could be improved with curve sampling
+        value *= heightNorm;
+    }
+    
+    return value * layer.amplitude;
+}
+
+// Evaluate all layers
+float evaluateNoiseStack(float3 worldPos)
+{
+    float result = 0.0;
+    
+    for (int i = 0; i < LayerCount && i < MAX_LAYERS; i++)
+    {
+        NoiseLayer layer = Layers[i];
+        if (!layer.enabled) continue;
+        
+        float layerValue = sampleLayer(layer, worldPos);
+        
+        // Apply blend mode
+        if (layer.blendMode == 0) // Add
+            result += layerValue;
+        else if (layer.blendMode == 1) // Subtract
+            result -= layerValue;
+        else if (layer.blendMode == 2) // Multiply
+            result *= layerValue;
+        else if (layer.blendMode == 3) // Min
+            result = min(result, layerValue);
+        else if (layer.blendMode == 4) // Max
+            result = max(result, layerValue);
+        else if (layer.blendMode == 5) // Override
+            result = layerValue;
+    }
+    
+    return result;
+}
+
+[numthreads(8, 8, 8)]
+void GenerateNoiseField(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (id.x >= CHUNK_SIZE + 1 || id.y >= CHUNK_SIZE + 1 || id.z >= CHUNK_SIZE + 1)
+        return;
+    
+    // Calculate world position
+    float3 localPos = float3(id.x, id.y, id.z) * VOXEL_SIZE;
+    float3 worldPos = ChunkOrigin + localPos;
+    
+    // Evaluate noise
+    float density = evaluateNoiseStack(worldPos);
+    
+    // Write to buffer
+    uint index = id.x + id.y * (CHUNK_SIZE + 1) + id.z * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1);
+    DensityField[index] = density;
+}
+
+[numthreads(8, 8, 1)]
+void GenerateNoisePreview(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    PreviewTexture.GetDimensions(width, height);
+    
+    if (id.x >= width || id.y >= height)
+        return;
+    
+    // Sample position in world space (50 units across)
+    float3 worldPos = float3(
+        (id.x / (float)width - 0.5) * 50.0,
+        0.0,
+        (id.y / (float)height - 0.5) * 50.0
+    );
+    
+    // Evaluate noise
+    float value = evaluateNoiseStack(worldPos);
+    
+    // Remap to 0-1 for visualization
+    value = saturate(value * 0.5 + 0.5);
+    
+    // Write to texture
+    PreviewTexture[id.xy] = float4(value, value, value, 1.0);
+}

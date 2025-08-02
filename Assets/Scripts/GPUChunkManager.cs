@@ -8,7 +8,7 @@ using UnityEngine.Rendering;
 public class GPUChunkManager : MonoBehaviour
 {
     [Header("Compute Shaders")]
-    public ComputeShader caveGenerationShader;
+    public ComputeShader noiseGenerationShader;
     public ComputeShader meshGenerationShader;
     
     [Header("Settings")]
@@ -16,29 +16,10 @@ public class GPUChunkManager : MonoBehaviour
     public Material caveMaterial;
     
     [Header("Debug")]
-    public bool useDebugKernel = false;
-    public bool logDensityStats = true;
+    public bool showNoisePreview = false;
+    private RenderTexture noisePreviewTexture;
     
-    private ComputeBuffer densityBuffer;
-    private ComputeBuffer chamberBuffer;
-    private ComputeBuffer vertexBuffer;
-    private ComputeBuffer triangleBuffer;
-    private ComputeBuffer counterBuffer;
-    
-    private int generateDensityKernel = -1;
-    private int generateChamberKernel = -1;
-    private int generateTunnelKernel = -1;
-    private int debugKernel = -1;
-    
-    private const int CHUNK_SIZE = 32;
-    private const float VOXEL_SIZE = 0.25f;
-    
-    private bool isInitialized = false;
-    
-    // Marching cubes tables
-    private ComputeBuffer edgeTableBuffer;
-    private ComputeBuffer triTableBuffer;
-    
+    // Request structure
     public struct GPUChunkRequest
     {
         public Vector3Int coordinate;
@@ -46,6 +27,7 @@ public class GPUChunkManager : MonoBehaviour
         public System.Action<ChunkMeshData> onComplete;
     }
     
+    // Mesh data structure
     public struct ChunkMeshData
     {
         public Vector3[] vertices;
@@ -54,59 +36,91 @@ public class GPUChunkManager : MonoBehaviour
         public Vector2[] uvs;
     }
     
-    private Queue<GPUChunkRequest> requestQueue = new Queue<GPUChunkRequest>();
-    private bool isProcessing = false;
+    // Noise layer data for GPU
+    private ComputeBuffer noiseLayerBuffer;
+    private ComputeBuffer densityBuffer;
+    private ComputeBuffer chamberBuffer;
+    private ComputeBuffer vertexBuffer;
+    private ComputeBuffer triangleBuffer;
+    private ComputeBuffer counterBuffer;
+    
+    // Additional buffers for marching cubes
+    private ComputeBuffer voxelOccupiedBuffer;
+    private ComputeBuffer voxelVertexCountBuffer;
+    private ComputeBuffer voxelVertexOffsetBuffer;
+    
+    // Marching cubes tables
+    private ComputeBuffer edgeTableBuffer;
+    private ComputeBuffer triTableBuffer;
+    
+    private int generateNoiseFieldKernel = -1;
+    private int generateNoisePreviewKernel = -1;
+    private int marchingCubesKernel = -1;
+    
+    private const int CHUNK_SIZE = 32;
+    private const float VOXEL_SIZE = 0.25f;
+    private const int MAX_VERTICES = 65536;
+    private const int MAX_TRIANGLES = MAX_VERTICES * 3;
+    
+    private bool isInitialized = false;
+    private WorldManager worldManager;
+    
+    // Struct matching the compute shader
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    struct GPUNoiseLayer
+    {
+        public int enabled;
+        public int noiseType;
+        public int blendMode;
+        public float frequency;
+        public float amplitude;
+        public int octaves;
+        public float persistence;
+        public float lacunarity;
+        public Vector3 offset;
+        public float verticalSquash;
+        public float densityBias;
+        public float power;
+        public float minHeight;
+        public float maxHeight;
+        public int useHeightConstraints;
+        public float _padding; // Align to 16 bytes
+    }
     
     void Start()
     {
+        worldManager = GetComponent<WorldManager>();
         if (!InitializeComputeShaders())
         {
             enabled = false;
             return;
         }
         InitializeBuffers();
-        InitializeMarchingCubesTables();
         isInitialized = true;
     }
     
     bool InitializeComputeShaders()
     {
-        if (caveGenerationShader == null)
+        if (noiseGenerationShader == null)
         {
-            UnityEngine.Debug.LogError("Cave generation compute shader not assigned to GPUChunkManager!");
+            Debug.LogError("Noise generation compute shader not assigned!");
             return false;
         }
         
-        // Find kernels with error checking
-        try
+        if (meshGenerationShader == null)
         {
-            generateDensityKernel = caveGenerationShader.FindKernel("GenerateDensityField");
-            generateChamberKernel = caveGenerationShader.FindKernel("GenerateChamberField");
-            generateTunnelKernel = caveGenerationShader.FindKernel("GenerateTunnelField");
-            
-            // Try to find debug kernel (optional)
-            try
-            {
-                debugKernel = caveGenerationShader.FindKernel("DebugDensityField");
-            }
-            catch
-            {
-                UnityEngine.Debug.LogWarning("Debug kernel not found in compute shader");
-                debugKernel = -1;
-            }
-            
-            UnityEngine.Debug.Log($"Found kernels: Density={generateDensityKernel}, Chamber={generateChamberKernel}, Tunnel={generateTunnelKernel}, Debug={debugKernel}");
-        }
-        catch (System.Exception e)
-        {
-            UnityEngine.Debug.LogError($"Failed to find compute shader kernels: {e.Message}");
+            Debug.LogError("Mesh generation compute shader not assigned!");
             return false;
         }
         
-        // Validate kernels
-        if (generateDensityKernel < 0)
+        // Find kernels
+        generateNoiseFieldKernel = noiseGenerationShader.FindKernel("GenerateNoiseField");
+        generateNoisePreviewKernel = noiseGenerationShader.FindKernel("GenerateNoisePreview");
+        marchingCubesKernel = meshGenerationShader.FindKernel("MarchingCubes");
+        
+        if (generateNoiseFieldKernel < 0 || marchingCubesKernel < 0)
         {
-            UnityEngine.Debug.LogError("GenerateDensityField kernel not found in compute shader!");
+            Debug.LogError("Failed to find compute shader kernels!");
             return false;
         }
         
@@ -115,399 +129,263 @@ public class GPUChunkManager : MonoBehaviour
     
     void InitializeBuffers()
     {
+        int densitySize = (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1);
+        int voxelCount = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+        
         // Density field buffer
-        int voxelCount = (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1);
-        densityBuffer = new ComputeBuffer(voxelCount, sizeof(float));
+        densityBuffer = new ComputeBuffer(densitySize, sizeof(float));
         
-        // Vertex and triangle buffers for mesh generation
-        int maxVertices = voxelCount * 4;
-        int maxTriangles = voxelCount * 6;
+        // Vertex and triangle buffers
+        vertexBuffer = new ComputeBuffer(MAX_VERTICES, sizeof(float) * 3);
+        triangleBuffer = new ComputeBuffer(MAX_TRIANGLES, sizeof(int));
         
-        vertexBuffer = new ComputeBuffer(maxVertices, sizeof(float) * 3);
-        triangleBuffer = new ComputeBuffer(maxTriangles, sizeof(int));
-        counterBuffer = new ComputeBuffer(2, sizeof(uint), ComputeBufferType.Counter);
+        // Counter buffers
+        counterBuffer = new ComputeBuffer(2, sizeof(int), ComputeBufferType.Counter);
         
-        UnityEngine.Debug.Log($"Initialized GPU buffers: voxelCount={voxelCount}");
+        // Voxel processing buffers
+        voxelOccupiedBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
+        voxelVertexCountBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
+        voxelVertexOffsetBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
+        
+        // Initialize marching cubes tables
+        InitializeMarchingCubesTables();
+        
+        // Initialize chamber buffer with at least one element (even if empty)
+        if (chamberBuffer == null)
+        {
+            chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
+            chamberBuffer.SetData(new Vector3[] { Vector3.zero });
+        }
+        
+        // Noise preview texture
+        if (showNoisePreview)
+        {
+            CreatePreviewTexture();
+        }
     }
-
-    void InitializeMarchingCubesTables()
+    
+    void CreatePreviewTexture()
     {
-        edgeTableBuffer = new ComputeBuffer(256, sizeof(int));
-        edgeTableBuffer.SetData(MarchingCubesTables.EdgeTable);
-
-        triTableBuffer = new ComputeBuffer(256 * 16, sizeof(int));
-        triTableBuffer.SetData(MarchingCubesTables.TriTable);
+        if (noisePreviewTexture != null)
+        {
+            noisePreviewTexture.Release();
+        }
+        
+        noisePreviewTexture = new RenderTexture(256, 256, 0, RenderTextureFormat.ARGB32);
+        noisePreviewTexture.enableRandomWrite = true;
+        noisePreviewTexture.Create();
     }
-
+    
     public void RequestChunk(GPUChunkRequest request)
     {
-        if (!isInitialized)
-        {
-            UnityEngine.Debug.LogError("GPUChunkManager not initialized!");
-            return;
-        }
-        
-        requestQueue.Enqueue(request);
-        
-        if (!isProcessing)
-        {
-            ProcessNextRequest();
-        }
+        StartCoroutine(GenerateChunkAsync(request));
     }
     
-    void ProcessNextRequest()
+    IEnumerator GenerateChunkAsync(GPUChunkRequest request)
     {
-        if (requestQueue.Count == 0)
+        if (!isInitialized || worldManager == null)
         {
-            isProcessing = false;
-            return;
-        }
-        
-        isProcessing = true;
-        var request = requestQueue.Dequeue();
-        
-        StartCoroutine(GenerateChunkGPU(request));
-    }
-    
-    IEnumerator GenerateChunkGPU(GPUChunkRequest request)
-    {
-        // Validate shader and kernel before use
-        if (caveGenerationShader == null || generateDensityKernel < 0)
-        {
-            UnityEngine.Debug.LogError("Compute shader or kernel not properly initialized!");
-            request.onComplete?.Invoke(CreateEmptyMeshData());
-            ProcessNextRequest();
+            Debug.LogError("GPUChunkManager not properly initialized!");
             yield break;
         }
         
-        // Calculate chunk origin
+        // Update noise layer buffer
+        UpdateNoiseLayerBuffer();
+        
+        // Update chamber buffer if available
+        UpdateChamberBuffer();
+        
+        // Generate density field
         Vector3 chunkOrigin = new Vector3(
             request.coordinate.x * CHUNK_SIZE * VOXEL_SIZE,
             request.coordinate.y * CHUNK_SIZE * VOXEL_SIZE,
             request.coordinate.z * CHUNK_SIZE * VOXEL_SIZE
         );
         
-        UnityEngine.Debug.Log($"Generating chunk at: {chunkOrigin} (coord: {request.coordinate})");
+        // Set noise generation parameters
+        noiseGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
+        noiseGenerationShader.SetInt("LayerCount", worldManager.noiseLayerStack.layers.Count);
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "Layers", noiseLayerBuffer);
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "DensityField", densityBuffer);
         
-        // Set shader parameters
-        caveGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
-        
-        // Cave settings
-        caveGenerationShader.SetVector("CaveSettings1", new Vector4(
-            caveSettings.chamberFrequency,
-            caveSettings.chamberMinRadius,
-            caveSettings.chamberMaxRadius,
-            caveSettings.chamberFloorFlatness
-        ));
-        
-        caveGenerationShader.SetVector("CaveSettings2", new Vector4(
-            caveSettings.tunnelMinRadius,
-            caveSettings.tunnelMaxRadius,
-            caveSettings.stratificationStrength,
-            caveSettings.stratificationFrequency
-        ));
-        
-        caveGenerationShader.SetVector("CaveSettings3", new Vector4(
-            caveSettings.erosionStrength,
-            caveSettings.rockHardness,
-            caveSettings.minCaveHeight,
-            caveSettings.maxCaveHeight
-        ));
-        
-        caveGenerationShader.SetVector("NoiseSettings", new Vector4(
-            caveSettings.seed,
-            caveSettings.worleyOctaves,
-            caveSettings.worleyPersistence,
-            Time.time
-        ));
-        
-        // Set buffers
-        int kernelToUse = useDebugKernel && debugKernel >= 0 ? debugKernel : generateDensityKernel;
-        caveGenerationShader.SetBuffer(kernelToUse, "DensityField", densityBuffer);
-        
-        // Set chamber data if available
-        SetChamberData(kernelToUse);
-        
-        // Dispatch density generation
-        int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8.0f);
-        caveGenerationShader.Dispatch(kernelToUse, threadGroups, threadGroups, threadGroups);
-        
-        // Wait for GPU
-        // yield return new WaitForEndOfFrame();
-        
-        // Read back density data
-        float[] densityData = new float[(CHUNK_SIZE + 1) * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1)];
-        densityBuffer.GetData(densityData);
-        
-        // Generate mesh
-        ChunkMeshData meshData = GenerateMeshFromDensity(densityData, request.lodLevel, request.coordinate);
-        
-        // Callback with mesh data
-        request.onComplete?.Invoke(meshData);
-        
-        // Clean up temporary buffer
-        if (chamberBuffer != null)
+        // Always set chamber buffer
+        if (chamberBuffer == null)
         {
-            chamberBuffer.Release();
-            chamberBuffer = null;
+            chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
+            chamberBuffer.SetData(new Vector3[] { Vector3.zero });
         }
         
-        // Process next request
-        ProcessNextRequest();
-    }
-    
-    void SetChamberData(int kernel)
-    {
-        var worldManager = GetComponent<WorldManager>();
-        if (worldManager != null && worldManager.networkPreprocessor != null)
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "ChamberCenters", chamberBuffer);
+        noiseGenerationShader.SetInt("ChamberCount", 
+            (worldManager.networkPreprocessor != null && 
+             worldManager.networkPreprocessor.chamberCenters.IsCreated) ? 
+             worldManager.networkPreprocessor.chamberCenters.Length : 0);
+        
+        // Dispatch noise generation
+        int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8f);
+        noiseGenerationShader.Dispatch(generateNoiseFieldKernel, threadGroups, threadGroups, threadGroups);
+        
+        yield return null; // Wait a frame
+        
+        // Reset counters
+        counterBuffer.SetCounterValue(0);
+        
+        // Set mesh generation parameters
+        meshGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
+        meshGenerationShader.SetInt("LODLevel", request.lodLevel);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "DensityField", densityBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "Vertices", vertexBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "Triangles", triangleBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "VertexCount", counterBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "TriangleCount", counterBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "EdgeTable", edgeTableBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "TriTable", triTableBuffer);
+        
+        // Set the voxel processing buffers
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelOccupied", voxelOccupiedBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelVertexCount", voxelVertexCountBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelVertexOffset", voxelVertexOffsetBuffer);
+        
+        // Dispatch mesh generation
+        meshGenerationShader.Dispatch(marchingCubesKernel, threadGroups, threadGroups, threadGroups);
+        
+        yield return null; // Wait a frame
+        
+        // Read back results
+        int[] counts = new int[2];
+        counterBuffer.GetData(counts);
+        int vertexCount = counts[0];
+        int triangleCount = vertexCount; // Assuming triangle count equals vertex count
+        
+        if (vertexCount > 0 && vertexCount < MAX_VERTICES)
         {
-            var networkPreprocessor = worldManager.networkPreprocessor;
-            if (networkPreprocessor.chamberCenters != null && 
-                networkPreprocessor.chamberCenters.IsCreated && 
-                networkPreprocessor.chamberCenters.Length > 0)
+            // Read vertex data
+            Vector3[] vertices = new Vector3[vertexCount];
+            vertexBuffer.GetData(vertices, 0, 0, vertexCount);
+            
+            // Read triangle data
+            int[] triangles = new int[triangleCount];
+            triangleBuffer.GetData(triangles, 0, 0, triangleCount);
+            
+            // Create mesh data
+            ChunkMeshData meshData = new ChunkMeshData
             {
-                chamberBuffer = new ComputeBuffer(networkPreprocessor.chamberCenters.Length, sizeof(float) * 3);
-                chamberBuffer.SetData(networkPreprocessor.chamberCenters.ToArray());
-                
-                caveGenerationShader.SetBuffer(kernel, "ChamberCenters", chamberBuffer);
-                caveGenerationShader.SetInt("ChamberCount", networkPreprocessor.chamberCenters.Length);
-            }
-            else
-            {
-                caveGenerationShader.SetInt("ChamberCount", 0);
-            }
+                vertices = vertices,
+                triangles = triangles,
+                normals = CalculateNormals(vertices, triangles),
+                uvs = CalculateUVs(vertices)
+            };
+            
+            // Invoke callback
+            request.onComplete?.Invoke(meshData);
         }
         else
         {
-            caveGenerationShader.SetInt("ChamberCount", 0);
+            // Empty chunk
+            request.onComplete?.Invoke(new ChunkMeshData
+            {
+                vertices = new Vector3[0],
+                triangles = new int[0],
+                normals = new Vector3[0],
+                uvs = new Vector2[0]
+            });
         }
     }
     
-    ChunkMeshData GenerateMeshFromDensity(float[] densityData, int lodLevel, Vector3Int coordinate)
+    void UpdateNoiseLayerBuffer()
     {
-        // Debug density values
-        if (logDensityStats)
+        var layers = worldManager.noiseLayerStack.layers;
+        int layerCount = Mathf.Min(layers.Count, 16); // Max 16 layers
+        
+        // Create or resize buffer if needed
+        if (noiseLayerBuffer == null || noiseLayerBuffer.count != layerCount)
         {
-            LogDensityStats(densityData, coordinate);
+            noiseLayerBuffer?.Release();
+            if (layerCount > 0)
+            {
+                noiseLayerBuffer = new ComputeBuffer(layerCount, System.Runtime.InteropServices.Marshal.SizeOf<GPUNoiseLayer>());
+            }
         }
         
-        // Use marching cubes to generate mesh
-        List<Vector3> vertices = new List<Vector3>();
-        List<int> triangles = new List<int>();
-        
-        float isoLevel = 0.5f;
-        int step = 1 << lodLevel;
-        
-        for (int x = 0; x < CHUNK_SIZE; x += step)
+        if (layerCount > 0)
         {
-            for (int y = 0; y < CHUNK_SIZE; y += step)
+            // Convert layers to GPU format
+            GPUNoiseLayer[] gpuLayers = new GPUNoiseLayer[layerCount];
+            for (int i = 0; i < layerCount; i++)
             {
-                for (int z = 0; z < CHUNK_SIZE; z += step)
+                var layer = layers[i];
+                gpuLayers[i] = new GPUNoiseLayer
                 {
-                    ProcessVoxel(x, y, z, step, densityData, isoLevel, vertices, triangles);
-                }
+                    enabled = layer.enabled ? 1 : 0,
+                    noiseType = (int)layer.noiseType,
+                    blendMode = (int)layer.blendMode,
+                    frequency = layer.frequency,
+                    amplitude = layer.amplitude,
+                    octaves = layer.octaves,
+                    persistence = layer.persistence,
+                    lacunarity = layer.lacunarity,
+                    offset = layer.offset,
+                    verticalSquash = layer.verticalSquash,
+                    densityBias = layer.densityBias,
+                    power = layer.power,
+                    minHeight = layer.minHeight,
+                    maxHeight = layer.maxHeight,
+                    useHeightConstraints = layer.useHeightConstraints ? 1 : 0
+                };
             }
-        }
-        
-        if (vertices.Count == 0)
-        {
-            return CreateEmptyMeshData();
-        }
-        
-        // Calculate normals
-        Vector3[] normalsArray = CalculateNormals(vertices, triangles);
-        
-        // Generate UVs
-        Vector2[] uvs = new Vector2[vertices.Count];
-        for (int i = 0; i < vertices.Count; i++)
-        {
-            uvs[i] = new Vector2(vertices[i].x * 0.1f, vertices[i].z * 0.1f);
-        }
-        
-        UnityEngine.Debug.Log($"Chunk {coordinate}: Generated {vertices.Count} vertices, {triangles.Count / 3} triangles");
-        
-        return new ChunkMeshData
-        {
-            vertices = vertices.ToArray(),
-            triangles = triangles.ToArray(),
-            normals = normalsArray,
-            uvs = uvs
-        };
-    }
-
-    void ProcessVoxel(int x, int y, int z, int step, float[] densityData, float isoLevel,
-                      List<Vector3> vertices, List<int> triangles)
-    {
-        // Get density values at cube corners
-        float[] cube = new float[8];
-        cube[0] = GetDensity(densityData, x, y, z);
-        cube[1] = GetDensity(densityData, x + step, y, z);
-        cube[2] = GetDensity(densityData, x + step, y + step, z);
-        cube[3] = GetDensity(densityData, x, y + step, z);
-        cube[4] = GetDensity(densityData, x, y, z + step);
-        cube[5] = GetDensity(densityData, x + step, y, z + step);
-        cube[6] = GetDensity(densityData, x + step, y + step, z + step);
-        cube[7] = GetDensity(densityData, x, y + step, z + step);
-
-        // Determine cube configuration
-        int cubeIndex = 0;
-        if (cube[0] < isoLevel) cubeIndex |= 1;
-        if (cube[1] < isoLevel) cubeIndex |= 2;
-        if (cube[2] < isoLevel) cubeIndex |= 4;
-        if (cube[3] < isoLevel) cubeIndex |= 8;
-        if (cube[4] < isoLevel) cubeIndex |= 16;
-        if (cube[5] < isoLevel) cubeIndex |= 32;
-        if (cube[6] < isoLevel) cubeIndex |= 64;
-        if (cube[7] < isoLevel) cubeIndex |= 128;
-
-        // Skip if cube is entirely inside or outside
-        if (cubeIndex == 0 || cubeIndex == 255)
-            return;
-
-        // Use the edge table to find which edges are intersected
-        if (MarchingCubesTables.EdgeTable[cubeIndex] == 0)
-            return;
-
-        // Find the vertices where the surface intersects the cube edges
-        Vector3[] vertList = new Vector3[12];
-        float size = step * VOXEL_SIZE;
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 1) != 0)
-            vertList[0] = VertexInterp(isoLevel,
-                new Vector3(x, y, z) * VOXEL_SIZE,
-                new Vector3(x + step, y, z) * VOXEL_SIZE,
-                cube[0], cube[1]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 2) != 0)
-            vertList[1] = VertexInterp(isoLevel,
-                new Vector3(x + step, y, z) * VOXEL_SIZE,
-                new Vector3(x + step, y + step, z) * VOXEL_SIZE,
-                cube[1], cube[2]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 4) != 0)
-            vertList[2] = VertexInterp(isoLevel,
-                new Vector3(x + step, y + step, z) * VOXEL_SIZE,
-                new Vector3(x, y + step, z) * VOXEL_SIZE,
-                cube[2], cube[3]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 8) != 0)
-            vertList[3] = VertexInterp(isoLevel,
-                new Vector3(x, y + step, z) * VOXEL_SIZE,
-                new Vector3(x, y, z) * VOXEL_SIZE,
-                cube[3], cube[0]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 16) != 0)
-            vertList[4] = VertexInterp(isoLevel,
-                new Vector3(x, y, z + step) * VOXEL_SIZE,
-                new Vector3(x + step, y, z + step) * VOXEL_SIZE,
-                cube[4], cube[5]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 32) != 0)
-            vertList[5] = VertexInterp(isoLevel,
-                new Vector3(x + step, y, z + step) * VOXEL_SIZE,
-                new Vector3(x + step, y + step, z + step) * VOXEL_SIZE,
-                cube[5], cube[6]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 64) != 0)
-            vertList[6] = VertexInterp(isoLevel,
-                new Vector3(x + step, y + step, z + step) * VOXEL_SIZE,
-                new Vector3(x, y + step, z + step) * VOXEL_SIZE,
-                cube[6], cube[7]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 128) != 0)
-            vertList[7] = VertexInterp(isoLevel,
-                new Vector3(x, y + step, z + step) * VOXEL_SIZE,
-                new Vector3(x, y, z + step) * VOXEL_SIZE,
-                cube[7], cube[4]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 256) != 0)
-            vertList[8] = VertexInterp(isoLevel,
-                new Vector3(x, y, z) * VOXEL_SIZE,
-                new Vector3(x, y, z + step) * VOXEL_SIZE,
-                cube[0], cube[4]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 512) != 0)
-            vertList[9] = VertexInterp(isoLevel,
-                new Vector3(x + step, y, z) * VOXEL_SIZE,
-                new Vector3(x + step, y, z + step) * VOXEL_SIZE,
-                cube[1], cube[5]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 1024) != 0)
-            vertList[10] = VertexInterp(isoLevel,
-                new Vector3(x + step, y + step, z) * VOXEL_SIZE,
-                new Vector3(x + step, y + step, z + step) * VOXEL_SIZE,
-                cube[2], cube[6]);
-
-        if ((MarchingCubesTables.EdgeTable[cubeIndex] & 2048) != 0)
-            vertList[11] = VertexInterp(isoLevel,
-                new Vector3(x, y + step, z) * VOXEL_SIZE,
-                new Vector3(x, y + step, z + step) * VOXEL_SIZE,
-                cube[3], cube[7]);
-
-        // Create triangles
-        for (int i = 0; MarchingCubesTables.TriTable[cubeIndex * 16 + i] != -1; i += 3)
-        {
-            int baseIndex = vertices.Count;
-
-            vertices.Add(vertList[MarchingCubesTables.TriTable[cubeIndex * 16 + i]]);
-            vertices.Add(vertList[MarchingCubesTables.TriTable[cubeIndex * 16 + i + 1]]);
-            vertices.Add(vertList[MarchingCubesTables.TriTable[cubeIndex * 16 + i + 2]]);
-
-            triangles.Add(baseIndex);
-            triangles.Add(baseIndex + 1);
-            triangles.Add(baseIndex + 2);
+            
+            noiseLayerBuffer.SetData(gpuLayers);
         }
     }
-
-    void AddSimpleCube(List<Vector3> vertices, List<int> triangles, Vector3 position, float size)
+    
+    void UpdateChamberBuffer()
     {
-        int startIndex = vertices.Count;
-        
-        // Add vertices (8 corners)
-        vertices.Add(position + new Vector3(0, 0, 0));
-        vertices.Add(position + new Vector3(size, 0, 0));
-        vertices.Add(position + new Vector3(size, size, 0));
-        vertices.Add(position + new Vector3(0, size, 0));
-        vertices.Add(position + new Vector3(0, 0, size));
-        vertices.Add(position + new Vector3(size, 0, size));
-        vertices.Add(position + new Vector3(size, size, size));
-        vertices.Add(position + new Vector3(0, size, size));
-        
-        // Add triangles (12 triangles, 2 per face)
-        int[,] faces = new int[,] {
-            {0, 2, 1, 0, 3, 2}, // Front
-            {5, 6, 4, 4, 6, 7}, // Back
-            {3, 7, 6, 3, 6, 2}, // Top
-            {1, 5, 4, 1, 4, 0}, // Bottom
-            {1, 2, 6, 1, 6, 5}, // Right
-            {4, 7, 3, 4, 3, 0}  // Left
-        };
-        
-        for (int i = 0; i < 6; i++)
+        if (worldManager.networkPreprocessor != null && 
+            worldManager.networkPreprocessor.chamberCenters.IsCreated &&
+            worldManager.networkPreprocessor.chamberCenters.Length > 0)
         {
-            for (int j = 0; j < 6; j++)
+            int chamberCount = worldManager.networkPreprocessor.chamberCenters.Length;
+            
+            if (chamberBuffer == null || chamberBuffer.count != chamberCount)
             {
-                triangles.Add(startIndex + faces[i, j]);
+                chamberBuffer?.Release();
+                chamberBuffer = new ComputeBuffer(chamberCount, sizeof(float) * 3);
             }
+            
+            // Copy chamber data
+            Vector3[] chambers = new Vector3[chamberCount];
+            for (int i = 0; i < chamberCount; i++)
+            {
+                chambers[i] = worldManager.networkPreprocessor.chamberCenters[i];
+            }
+            chamberBuffer.SetData(chambers);
         }
     }
     
-    float GetDensity(float[] densityData, int x, int y, int z)
+    public void GenerateNoisePreview(int layerIndex = -1)
     {
-        x = Mathf.Clamp(x, 0, CHUNK_SIZE);
-        y = Mathf.Clamp(y, 0, CHUNK_SIZE);
-        z = Mathf.Clamp(z, 0, CHUNK_SIZE);
+        if (!isInitialized || noisePreviewTexture == null) return;
         
-        int index = x + y * (CHUNK_SIZE + 1) + z * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1);
-        return densityData[index];
+        UpdateNoiseLayerBuffer();
+        
+        // Set preview parameters
+        noiseGenerationShader.SetInt("LayerCount", 
+            layerIndex >= 0 ? layerIndex + 1 : worldManager.noiseLayerStack.layers.Count);
+        noiseGenerationShader.SetBuffer(generateNoisePreviewKernel, "Layers", noiseLayerBuffer);
+        noiseGenerationShader.SetTexture(generateNoisePreviewKernel, "PreviewTexture", noisePreviewTexture);
+        
+        // Dispatch preview generation
+        int threadGroupsX = Mathf.CeilToInt(noisePreviewTexture.width / 8f);
+        int threadGroupsY = Mathf.CeilToInt(noisePreviewTexture.height / 8f);
+        noiseGenerationShader.Dispatch(generateNoisePreviewKernel, threadGroupsX, threadGroupsY, 1);
     }
     
-    Vector3[] CalculateNormals(List<Vector3> vertices, List<int> triangles)
+    Vector3[] CalculateNormals(Vector3[] vertices, int[] triangles)
     {
-        Vector3[] normals = new Vector3[vertices.Count];
+        Vector3[] normals = new Vector3[vertices.Length];
         
-        // Calculate face normals
-        for (int i = 0; i < triangles.Count; i += 3)
+        // Calculate face normals and accumulate
+        for (int i = 0; i < triangles.Length; i += 3)
         {
             int i0 = triangles[i];
             int i1 = triangles[i + 1];
@@ -533,67 +411,84 @@ public class GPUChunkManager : MonoBehaviour
         return normals;
     }
     
-    void LogDensityStats(float[] densityData, Vector3Int coordinate)
+    Vector2[] CalculateUVs(Vector3[] vertices)
     {
-        float minDensity = float.MaxValue;
-        float maxDensity = float.MinValue;
-        int solidCount = 0;
-        int airCount = 0;
-        int mixedCount = 0;
+        Vector2[] uvs = new Vector2[vertices.Length];
         
-        for (int i = 0; i < densityData.Length; i++)
+        for (int i = 0; i < vertices.Length; i++)
         {
-            float density = densityData[i];
-            minDensity = Mathf.Min(minDensity, density);
-            maxDensity = Mathf.Max(maxDensity, density);
-            
-            if (density > 0.9f) solidCount++;
-            else if (density < 0.1f) airCount++;
-            else mixedCount++;
+            // Simple triplanar mapping
+            uvs[i] = new Vector2(vertices[i].x * 0.1f, vertices[i].z * 0.1f);
         }
         
-        UnityEngine.Debug.Log($"Chunk {coordinate} density: Min={minDensity:F3}, Max={maxDensity:F3}, " +
-                            $"Solid={solidCount}, Air={airCount}, Mixed={mixedCount}");
-        
-        if (Mathf.Approximately(minDensity, maxDensity))
-        {
-            UnityEngine.Debug.LogWarning($"Chunk {coordinate}: All density values are {minDensity}!");
-        }
+        return uvs;
     }
     
-    ChunkMeshData CreateEmptyMeshData()
+    void InitializeMarchingCubesTables()
     {
-        return new ChunkMeshData
-        {
-            vertices = new Vector3[0],
-            triangles = new int[0],
-            normals = new Vector3[0],
-            uvs = new Vector2[0]
-        };
+        // Initialize edge table
+        edgeTableBuffer = new ComputeBuffer(256, sizeof(int));
+        edgeTableBuffer.SetData(MarchingCubesTables.EdgeTable);
+        
+        // Initialize triangle table
+        triTableBuffer = new ComputeBuffer(256 * 16, sizeof(int));
+        triTableBuffer.SetData(MarchingCubesTables.TriTable);
     }
     
     void OnDestroy()
     {
-        // Release all buffers
-        densityBuffer?.Release();
-        vertexBuffer?.Release();
-        triangleBuffer?.Release();
-        chamberBuffer?.Release();
-        counterBuffer?.Release();
-        edgeTableBuffer?.Release();
-        triTableBuffer?.Release();
+        // Clean up buffers
+        if (densityBuffer != null && densityBuffer.IsValid())
+            densityBuffer.Release();
+        
+        if (noiseLayerBuffer != null && noiseLayerBuffer.IsValid())
+            noiseLayerBuffer.Release();
+            
+        if (chamberBuffer != null && chamberBuffer.IsValid())
+            chamberBuffer.Release();
+            
+        if (vertexBuffer != null && vertexBuffer.IsValid())
+            vertexBuffer.Release();
+            
+        if (triangleBuffer != null && triangleBuffer.IsValid())
+            triangleBuffer.Release();
+            
+        if (counterBuffer != null && counterBuffer.IsValid())
+            counterBuffer.Release();
+            
+        if (voxelOccupiedBuffer != null && voxelOccupiedBuffer.IsValid())
+            voxelOccupiedBuffer.Release();
+            
+        if (voxelVertexCountBuffer != null && voxelVertexCountBuffer.IsValid())
+            voxelVertexCountBuffer.Release();
+            
+        if (voxelVertexOffsetBuffer != null && voxelVertexOffsetBuffer.IsValid())
+            voxelVertexOffsetBuffer.Release();
+            
+        if (edgeTableBuffer != null && edgeTableBuffer.IsValid())
+            edgeTableBuffer.Release();
+            
+        if (triTableBuffer != null && triTableBuffer.IsValid())
+            triTableBuffer.Release();
+            
+        // Safely release render texture
+        if (noisePreviewTexture != null)
+        {
+            noisePreviewTexture.Release();
+            if (Application.isPlaying)
+                Destroy(noisePreviewTexture);
+            else
+                DestroyImmediate(noisePreviewTexture);
+            noisePreviewTexture = null;
+        }
     }
-
-    Vector3 VertexInterp(float isoLevel, Vector3 p1, Vector3 p2, float v1, float v2)
+    
+    void OnGUI()
     {
-        if (Mathf.Abs(isoLevel - v1) < 0.00001f)
-            return p1;
-        if (Mathf.Abs(isoLevel - v2) < 0.00001f)
-            return p2;
-        if (Mathf.Abs(v1 - v2) < 0.00001f)
-            return p1;
-
-        float t = (isoLevel - v1) / (v2 - v1);
-        return p1 + t * (p2 - p1);
+        if (showNoisePreview && noisePreviewTexture != null)
+        {
+            GUI.DrawTexture(new Rect(10, 10, 256, 256), noisePreviewTexture);
+            GUI.Label(new Rect(10, 270, 256, 20), "Noise Preview (2D Slice at Y=0)");
+        }
     }
 }

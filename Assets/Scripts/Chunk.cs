@@ -1,191 +1,109 @@
 using System.Collections.Generic;
 using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 
+[RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
 public class Chunk : MonoBehaviour
 {
-    public const int CHUNK_SIZE = 32;
-    public const float VOXEL_SIZE = 0.25f;
+    // Chunk properties
+    public Vector3Int coordinate { get; private set; }
+    public int chunkSize { get; private set; }
+    public float voxelSize { get; private set; }
+    public float[,,] voxelData { get; set; }
     
-    private float[,,] voxelData;
+    // Mesh components
     private MeshFilter meshFilter;
     private MeshRenderer meshRenderer;
     private MeshCollider meshCollider;
+    private Mesh mesh;
     
-    public Vector3Int Coordinate { get; private set; }
-    public int LODLevel { get; private set; }
+    // Generation data
+    public JobHandle? generationHandle;
+    public NativeArray<float> densityField;
     
-    // Mesh generation
+    // Mesh data
     private List<Vector3> vertices = new List<Vector3>();
     private List<int> triangles = new List<int>();
     private List<Vector3> normals = new List<Vector3>();
     private List<Vector2> uvs = new List<Vector2>();
     
-    // Marching cubes lookup tables
-    private static readonly int[] edgeTable = new int[256];
-    private static readonly int[,] triTable = new int[256, 16];
+    // Constants
+    private const float ISO_LEVEL = 0.5f;
     
     void Awake()
     {
-        voxelData = new float[CHUNK_SIZE + 1, CHUNK_SIZE + 1, CHUNK_SIZE + 1];
-        
         meshFilter = GetComponent<MeshFilter>();
-        if (meshFilter == null)
-            meshFilter = gameObject.AddComponent<MeshFilter>();
-            
         meshRenderer = GetComponent<MeshRenderer>();
-        if (meshRenderer == null)
-            meshRenderer = gameObject.AddComponent<MeshRenderer>();
-            
         meshCollider = GetComponent<MeshCollider>();
-        if (meshCollider == null)
-            meshCollider = gameObject.AddComponent<MeshCollider>();
-            
-        InitializeMarchingCubesTables();
-    }
-    
-    public void Initialize(Vector3Int coordinate, Material material, int lodLevel = 0)
-    {
-        Coordinate = coordinate;
-        LODLevel = lodLevel;
-        transform.position = new Vector3(
-            coordinate.x * CHUNK_SIZE * VOXEL_SIZE,
-            coordinate.y * CHUNK_SIZE * VOXEL_SIZE,
-            coordinate.z * CHUNK_SIZE * VOXEL_SIZE
-        );
         
-        if (material != null)
-            meshRenderer.material = material;
+        mesh = new Mesh();
+        mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32; // Support for more vertices
+        meshFilter.mesh = mesh;
     }
     
-    public void SetVoxelDataFromJob(NativeArray<float> jobData)
+    public void Initialize(Vector3Int coord, int size, float voxelScale)
     {
-        int index = 0;
-        for (int x = 0; x <= CHUNK_SIZE; x++)
+        coordinate = coord;
+        chunkSize = size;
+        voxelSize = voxelScale;
+        name = $"Chunk_{coord.x}_{coord.y}_{coord.z}";
+        
+        // Initialize voxel data array
+        voxelData = new float[chunkSize + 1, chunkSize + 1, chunkSize + 1];
+    }
+    
+    public void Initialize(Vector3Int coord, Material material, int size, float voxelScale)
+    {
+        Initialize(coord, size, voxelScale);
+        
+        if (meshRenderer != null && material != null)
         {
-            for (int y = 0; y <= CHUNK_SIZE; y++)
-            {
-                for (int z = 0; z <= CHUNK_SIZE; z++)
-                {
-                    if (index < jobData.Length)
-                        voxelData[x, y, z] = jobData[index++];
-                }
-            }
+            meshRenderer.material = material;
         }
     }
     
-    public void GenerateSmoothMesh()
+    public void GenerateMesh()
     {
         vertices.Clear();
         triangles.Clear();
         normals.Clear();
         uvs.Clear();
         
-        // Debug: Check density values
-        if (LODLevel == 0 && Coordinate == Vector3Int.zero)
+        // Generate mesh using marching cubes
+        for (int x = 0; x < chunkSize; x++)
         {
-            int solidCount = 0;
-            int airCount = 0;
-            for (int x = 0; x <= CHUNK_SIZE; x++)
+            for (int y = 0; y < chunkSize; y++)
             {
-                for (int y = 0; y <= CHUNK_SIZE; y++)
+                for (int z = 0; z < chunkSize; z++)
                 {
-                    for (int z = 0; z <= CHUNK_SIZE; z++)
-                    {
-                        if (voxelData[x, y, z] > 0.5f) solidCount++;
-                        else airCount++;
-                    }
-                }
-            }
-            Debug.Log($"Chunk {Coordinate}: Solid voxels: {solidCount}, Air voxels: {airCount}");
-        }
-        
-        // Use simple voxel mesh for testing
-        // GenerateMarchingCubesMesh();
-        GenerateSimpleVoxelMesh();
-        
-        if (vertices.Count == 0)
-        {
-            // No geometry to generate
-            if (meshFilter.mesh != null)
-            {
-                meshFilter.mesh.Clear();
-            }
-            return;
-        }
-        
-        // Create mesh
-        Mesh mesh = new Mesh();
-        mesh.name = "Cave Chunk Mesh";
-        
-        // Use 32-bit indices for meshes with many vertices
-        if (vertices.Count > 65535)
-        {
-            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-        }
-        
-        mesh.vertices = vertices.ToArray();
-        mesh.triangles = triangles.ToArray();
-        
-        // Calculate normals if not already done
-        if (normals.Count == vertices.Count)
-        {
-            mesh.normals = normals.ToArray();
-        }
-        else
-        {
-            mesh.RecalculateNormals();
-        }
-        
-        mesh.uv = uvs.ToArray();
-        mesh.RecalculateBounds();
-        mesh.RecalculateTangents();
-        mesh.Optimize();
-        
-        meshFilter.mesh = mesh;
-        
-        // Update collider with simplified mesh if needed
-        if (meshCollider.enabled && LODLevel == 0)
-        {
-            meshCollider.sharedMesh = mesh;
-        }
-    }
-    
-    void GenerateMarchingCubesMesh()
-    {
-        float isoLevel = 0.5f; // Surface level
-        int stepSize = 1 << LODLevel; // Skip voxels for LOD
-        
-        for (int x = 0; x < CHUNK_SIZE; x += stepSize)
-        {
-            for (int y = 0; y < CHUNK_SIZE; y += stepSize)
-            {
-                for (int z = 0; z < CHUNK_SIZE; z += stepSize)
-                {
-                    ProcessMarchingCubesVoxel(x, y, z, isoLevel, stepSize);
+                    ProcessVoxel(x, y, z);
                 }
             }
         }
+        
+        UpdateMesh();
     }
     
-    void ProcessMarchingCubesVoxel(int x, int y, int z, float isoLevel, int stepSize)
+    void ProcessVoxel(int x, int y, int z)
     {
-        // Get the 8 corner values
-        float[] cubeCorners = new float[8];
-        cubeCorners[0] = GetVoxelValue(x, y, z);
-        cubeCorners[1] = GetVoxelValue(x + stepSize, y, z);
-        cubeCorners[2] = GetVoxelValue(x + stepSize, y, z + stepSize);
-        cubeCorners[3] = GetVoxelValue(x, y, z + stepSize);
-        cubeCorners[4] = GetVoxelValue(x, y + stepSize, z);
-        cubeCorners[5] = GetVoxelValue(x + stepSize, y + stepSize, z);
-        cubeCorners[6] = GetVoxelValue(x + stepSize, y + stepSize, z + stepSize);
-        cubeCorners[7] = GetVoxelValue(x, y + stepSize, z + stepSize);
+        // Sample density at 8 corners of the voxel
+        float[] cornerDensities = new float[8];
+        cornerDensities[0] = voxelData[x, y, z];
+        cornerDensities[1] = voxelData[x + 1, y, z];
+        cornerDensities[2] = voxelData[x + 1, y + 1, z];
+        cornerDensities[3] = voxelData[x, y + 1, z];
+        cornerDensities[4] = voxelData[x, y, z + 1];
+        cornerDensities[5] = voxelData[x + 1, y, z + 1];
+        cornerDensities[6] = voxelData[x + 1, y + 1, z + 1];
+        cornerDensities[7] = voxelData[x, y + 1, z + 1];
         
-        // Calculate the cube index
+        // Calculate cube index
         int cubeIndex = 0;
         for (int i = 0; i < 8; i++)
         {
-            if (cubeCorners[i] < isoLevel)
+            if (cornerDensities[i] < ISO_LEVEL)
                 cubeIndex |= (1 << i);
         }
         
@@ -193,53 +111,48 @@ public class Chunk : MonoBehaviour
         if (cubeIndex == 0 || cubeIndex == 255)
             return;
         
-        // Get vertices positions
-        Vector3[] vertexPositions = new Vector3[8];
-        vertexPositions[0] = new Vector3(x, y, z) * VOXEL_SIZE;
-        vertexPositions[1] = new Vector3(x + stepSize, y, z) * VOXEL_SIZE;
-        vertexPositions[2] = new Vector3(x + stepSize, y, z + stepSize) * VOXEL_SIZE;
-        vertexPositions[3] = new Vector3(x, y, z + stepSize) * VOXEL_SIZE;
-        vertexPositions[4] = new Vector3(x, y + stepSize, z) * VOXEL_SIZE;
-        vertexPositions[5] = new Vector3(x + stepSize, y + stepSize, z) * VOXEL_SIZE;
-        vertexPositions[6] = new Vector3(x + stepSize, y + stepSize, z + stepSize) * VOXEL_SIZE;
-        vertexPositions[7] = new Vector3(x, y + stepSize, z + stepSize) * VOXEL_SIZE;
+        // Use edge table to find intersected edges
+        int edgeFlags = MarchingCubesTables.EdgeTable[cubeIndex];
+        if (edgeFlags == 0)
+            return;
         
-        // Find the vertices where the surface intersects the cube
-        Vector3[] vertexList = new Vector3[12];
+        // Calculate vertex positions on edges
+        Vector3[] edgeVertices = new Vector3[12];
+        Vector3 basePos = new Vector3(x, y, z) * voxelSize;
         
-        if ((edgeTable[cubeIndex] & 1) != 0)
-            vertexList[0] = VertexInterp(isoLevel, vertexPositions[0], vertexPositions[1], cubeCorners[0], cubeCorners[1]);
-        if ((edgeTable[cubeIndex] & 2) != 0)
-            vertexList[1] = VertexInterp(isoLevel, vertexPositions[1], vertexPositions[2], cubeCorners[1], cubeCorners[2]);
-        if ((edgeTable[cubeIndex] & 4) != 0)
-            vertexList[2] = VertexInterp(isoLevel, vertexPositions[2], vertexPositions[3], cubeCorners[2], cubeCorners[3]);
-        if ((edgeTable[cubeIndex] & 8) != 0)
-            vertexList[3] = VertexInterp(isoLevel, vertexPositions[3], vertexPositions[0], cubeCorners[3], cubeCorners[0]);
-        if ((edgeTable[cubeIndex] & 16) != 0)
-            vertexList[4] = VertexInterp(isoLevel, vertexPositions[4], vertexPositions[5], cubeCorners[4], cubeCorners[5]);
-        if ((edgeTable[cubeIndex] & 32) != 0)
-            vertexList[5] = VertexInterp(isoLevel, vertexPositions[5], vertexPositions[6], cubeCorners[5], cubeCorners[6]);
-        if ((edgeTable[cubeIndex] & 64) != 0)
-            vertexList[6] = VertexInterp(isoLevel, vertexPositions[6], vertexPositions[7], cubeCorners[6], cubeCorners[7]);
-        if ((edgeTable[cubeIndex] & 128) != 0)
-            vertexList[7] = VertexInterp(isoLevel, vertexPositions[7], vertexPositions[4], cubeCorners[7], cubeCorners[4]);
-        if ((edgeTable[cubeIndex] & 256) != 0)
-            vertexList[8] = VertexInterp(isoLevel, vertexPositions[0], vertexPositions[4], cubeCorners[0], cubeCorners[4]);
-        if ((edgeTable[cubeIndex] & 512) != 0)
-            vertexList[9] = VertexInterp(isoLevel, vertexPositions[1], vertexPositions[5], cubeCorners[1], cubeCorners[5]);
-        if ((edgeTable[cubeIndex] & 1024) != 0)
-            vertexList[10] = VertexInterp(isoLevel, vertexPositions[2], vertexPositions[6], cubeCorners[2], cubeCorners[6]);
-        if ((edgeTable[cubeIndex] & 2048) != 0)
-            vertexList[11] = VertexInterp(isoLevel, vertexPositions[3], vertexPositions[7], cubeCorners[3], cubeCorners[7]);
+        if ((edgeFlags & 1) != 0)
+            edgeVertices[0] = VertexInterp(basePos, basePos + Vector3.right * voxelSize, cornerDensities[0], cornerDensities[1]);
+        if ((edgeFlags & 2) != 0)
+            edgeVertices[1] = VertexInterp(basePos + Vector3.right * voxelSize, basePos + new Vector3(1, 1, 0) * voxelSize, cornerDensities[1], cornerDensities[2]);
+        if ((edgeFlags & 4) != 0)
+            edgeVertices[2] = VertexInterp(basePos + new Vector3(1, 1, 0) * voxelSize, basePos + Vector3.up * voxelSize, cornerDensities[2], cornerDensities[3]);
+        if ((edgeFlags & 8) != 0)
+            edgeVertices[3] = VertexInterp(basePos + Vector3.up * voxelSize, basePos, cornerDensities[3], cornerDensities[0]);
+        if ((edgeFlags & 16) != 0)
+            edgeVertices[4] = VertexInterp(basePos + Vector3.forward * voxelSize, basePos + new Vector3(1, 0, 1) * voxelSize, cornerDensities[4], cornerDensities[5]);
+        if ((edgeFlags & 32) != 0)
+            edgeVertices[5] = VertexInterp(basePos + new Vector3(1, 0, 1) * voxelSize, basePos + new Vector3(1, 1, 1) * voxelSize, cornerDensities[5], cornerDensities[6]);
+        if ((edgeFlags & 64) != 0)
+            edgeVertices[6] = VertexInterp(basePos + new Vector3(1, 1, 1) * voxelSize, basePos + new Vector3(0, 1, 1) * voxelSize, cornerDensities[6], cornerDensities[7]);
+        if ((edgeFlags & 128) != 0)
+            edgeVertices[7] = VertexInterp(basePos + new Vector3(0, 1, 1) * voxelSize, basePos + Vector3.forward * voxelSize, cornerDensities[7], cornerDensities[4]);
+        if ((edgeFlags & 256) != 0)
+            edgeVertices[8] = VertexInterp(basePos, basePos + Vector3.forward * voxelSize, cornerDensities[0], cornerDensities[4]);
+        if ((edgeFlags & 512) != 0)
+            edgeVertices[9] = VertexInterp(basePos + Vector3.right * voxelSize, basePos + new Vector3(1, 0, 1) * voxelSize, cornerDensities[1], cornerDensities[5]);
+        if ((edgeFlags & 1024) != 0)
+            edgeVertices[10] = VertexInterp(basePos + new Vector3(1, 1, 0) * voxelSize, basePos + new Vector3(1, 1, 1) * voxelSize, cornerDensities[2], cornerDensities[6]);
+        if ((edgeFlags & 2048) != 0)
+            edgeVertices[11] = VertexInterp(basePos + Vector3.up * voxelSize, basePos + new Vector3(0, 1, 1) * voxelSize, cornerDensities[3], cornerDensities[7]);
         
         // Create triangles
-        for (int i = 0; triTable[cubeIndex, i] != -1; i += 3)
+        for (int i = 0; MarchingCubesTables.TriTable[cubeIndex * 16 + i] != -1; i += 3)
         {
             int vertexIndex = vertices.Count;
             
-            Vector3 v1 = vertexList[triTable[cubeIndex, i]];
-            Vector3 v2 = vertexList[triTable[cubeIndex, i + 1]];
-            Vector3 v3 = vertexList[triTable[cubeIndex, i + 2]];
+            Vector3 v1 = edgeVertices[MarchingCubesTables.TriTable[cubeIndex * 16 + i]];
+            Vector3 v2 = edgeVertices[MarchingCubesTables.TriTable[cubeIndex * 16 + i + 1]];
+            Vector3 v3 = edgeVertices[MarchingCubesTables.TriTable[cubeIndex * 16 + i + 2]];
             
             vertices.Add(v1);
             vertices.Add(v2);
@@ -251,7 +164,7 @@ public class Chunk : MonoBehaviour
             normals.Add(normal);
             normals.Add(normal);
             
-            // UVs based on world position
+            // Simple UV mapping
             uvs.Add(new Vector2(v1.x * 0.1f, v1.z * 0.1f));
             uvs.Add(new Vector2(v2.x * 0.1f, v2.z * 0.1f));
             uvs.Add(new Vector2(v3.x * 0.1f, v3.z * 0.1f));
@@ -262,131 +175,92 @@ public class Chunk : MonoBehaviour
         }
     }
     
-    Vector3 VertexInterp(float isolevel, Vector3 p1, Vector3 p2, float valp1, float valp2)
+    Vector3 VertexInterp(Vector3 p1, Vector3 p2, float v1, float v2)
     {
-        if (Mathf.Abs(isolevel - valp1) < 0.00001f)
+        if (Mathf.Abs(ISO_LEVEL - v1) < 0.00001f)
             return p1;
-        if (Mathf.Abs(isolevel - valp2) < 0.00001f)
+        if (Mathf.Abs(ISO_LEVEL - v2) < 0.00001f)
             return p2;
-        if (Mathf.Abs(valp1 - valp2) < 0.00001f)
+        if (Mathf.Abs(v1 - v2) < 0.00001f)
             return p1;
         
-        float mu = (isolevel - valp1) / (valp2 - valp1);
+        float mu = (ISO_LEVEL - v1) / (v2 - v1);
         return Vector3.Lerp(p1, p2, mu);
     }
     
-    float GetVoxelValue(int x, int y, int z)
+    void UpdateMesh()
     {
-        x = Mathf.Clamp(x, 0, CHUNK_SIZE);
-        y = Mathf.Clamp(y, 0, CHUNK_SIZE);
-        z = Mathf.Clamp(z, 0, CHUNK_SIZE);
-        return voxelData[x, y, z];
+        if (mesh == null) return;
+        
+        mesh.Clear();
+        
+        if (vertices.Count > 0)
+        {
+            mesh.SetVertices(vertices);
+            mesh.SetTriangles(triangles, 0);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            
+            mesh.RecalculateBounds();
+            
+            // Update collision mesh
+            if (meshCollider != null)
+            {
+                meshCollider.sharedMesh = mesh;
+            }
+        }
     }
     
-    void InitializeMarchingCubesTables()
-    {
-        // For testing, use simple voxel rendering instead
-        // In production, implement full marching cubes tables
-    }
-    
-    // Alternative simple voxel mesh generation for testing
-    public void GenerateSimpleVoxelMesh()
+    public void SetMeshData(Vector3[] verts, int[] tris, Vector3[] norms, Vector2[] uvCoords)
     {
         vertices.Clear();
         triangles.Clear();
         normals.Clear();
         uvs.Clear();
         
-        float threshold = 0.5f;
+        vertices.AddRange(verts);
+        triangles.AddRange(tris);
+        normals.AddRange(norms);
+        uvs.AddRange(uvCoords);
         
-        for (int x = 0; x < CHUNK_SIZE; x++)
+        UpdateMesh();
+    }
+    
+    public int GetVertexCount()
+    {
+        return vertices.Count;
+    }
+    
+    public void SetDensityFromNativeArray(NativeArray<float> densityData)
+    {
+        if (!densityData.IsCreated) return;
+        
+        int index = 0;
+        for (int z = 0; z <= chunkSize; z++)
         {
-            for (int y = 0; y < CHUNK_SIZE; y++)
+            for (int y = 0; y <= chunkSize; y++)
             {
-                for (int z = 0; z < CHUNK_SIZE; z++)
+                for (int x = 0; x <= chunkSize; x++)
                 {
-                    if (voxelData[x, y, z] > threshold)
-                    {
-                        // Check each face
-                        Vector3 pos = new Vector3(x, y, z) * VOXEL_SIZE;
-                        
-                        // Left face (X-)
-                        if (x == 0 || voxelData[x - 1, y, z] <= threshold)
-                            AddQuadFace(pos, Vector3.up * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.left);
-                        
-                        // Right face (X+)
-                        if (x == CHUNK_SIZE - 1 || voxelData[x + 1, y, z] <= threshold)
-                            AddQuadFace(pos + Vector3.right * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.right);
-                        
-                        // Bottom face (Y-)
-                        if (y == 0 || voxelData[x, y - 1, z] <= threshold)
-                            AddQuadFace(pos, Vector3.forward * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.down);
-                        
-                        // Top face (Y+)
-                        if (y == CHUNK_SIZE - 1 || voxelData[x, y + 1, z] <= threshold)
-                            AddQuadFace(pos + Vector3.up * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.forward * VOXEL_SIZE, Vector3.up);
-                        
-                        // Back face (Z-)
-                        if (z == 0 || voxelData[x, y, z - 1] <= threshold)
-                            AddQuadFace(pos, Vector3.right * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.back);
-                        
-                        // Front face (Z+)
-                        if (z == CHUNK_SIZE - 1 || voxelData[x, y, z + 1] <= threshold)
-                            AddQuadFace(pos + Vector3.forward * VOXEL_SIZE, Vector3.up * VOXEL_SIZE, Vector3.right * VOXEL_SIZE, Vector3.forward);
-                    }
+                    voxelData[x, y, z] = densityData[index++];
                 }
             }
         }
-        
-        if (vertices.Count == 0) return;
-        
-        // Create mesh
-        Mesh mesh = new Mesh();
-        mesh.name = "Simple Voxel Mesh";
-        
-        if (vertices.Count > 65535)
-            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-        
-        mesh.vertices = vertices.ToArray();
-        mesh.triangles = triangles.ToArray();
-        mesh.normals = normals.ToArray();
-        mesh.uv = uvs.ToArray();
-        mesh.RecalculateBounds();
-        mesh.Optimize();
-        
-        meshFilter.mesh = mesh;
-        
-        if (meshCollider.enabled && LODLevel == 0)
-            meshCollider.sharedMesh = mesh;
     }
     
-    void AddQuadFace(Vector3 corner, Vector3 up, Vector3 right, Vector3 normal)
+    void OnDestroy()
     {
-        int vertexIndex = vertices.Count;
+        if (densityField.IsCreated)
+        {
+            densityField.Dispose();
+        }
         
-        // Add vertices
-        vertices.Add(corner);
-        vertices.Add(corner + up);
-        vertices.Add(corner + up + right);
-        vertices.Add(corner + right);
-        
-        // Add UVs
-        uvs.Add(new Vector2(0, 0));
-        uvs.Add(new Vector2(0, 1));
-        uvs.Add(new Vector2(1, 1));
-        uvs.Add(new Vector2(1, 0));
-        
-        // Add normals
-        for (int i = 0; i < 4; i++)
-            normals.Add(normal);
-        
-        // Add triangles
-        triangles.Add(vertexIndex);
-        triangles.Add(vertexIndex + 1);
-        triangles.Add(vertexIndex + 2);
-        
-        triangles.Add(vertexIndex);
-        triangles.Add(vertexIndex + 2);
-        triangles.Add(vertexIndex + 3);
+        if (mesh != null)
+        {
+            if (Application.isPlaying)
+                Destroy(mesh);
+            else
+                DestroyImmediate(mesh);
+        }
     }
 }

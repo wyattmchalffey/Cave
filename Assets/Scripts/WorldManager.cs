@@ -4,567 +4,445 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 
-public partial class WorldManager : MonoBehaviour
+public class WorldManager : MonoBehaviour
 {
-    [Header("World Settings")]
-    public Transform player;
-    public int viewDistance = 5;
-    public int lodDistance = 8;
-    public int unloadDistance = 2;
-    public int chunksPerFrame = 2;
+    [Header("Chunk Management")]
+    public GameObject chunkPrefab;
+    public int renderDistance = 5;
+    public int chunkSize = 32;
+    public float voxelSize = 0.25f;
     
     [Header("Cave Settings")]
     public CaveSettings caveSettings = CaveSettings.Default();
-    public Material caveMaterial;
+    
+    [Header("Noise Layer System")]
+    public NoiseLayerStack noiseLayerStack = new NoiseLayerStack();
     
     [Header("Optimization")]
     public bool useJobSystem = true;
-    public int maxConcurrentJobs = 4;
-    public bool enableLOD = true;
-    
-    [Header("Preprocessing")]
-    public bool generateNetworkOnStart = true;
-    public CaveNetworkPreprocessor networkPreprocessor;
-    
-    [Header("GPU Acceleration")]
     public bool useGPUGeneration = false;
-    public GPUChunkManager gpuChunkManager;
-    public ComputeShader caveGenerationShader;
-    public ComputeShader meshGenerationShader;
+    public int maxConcurrentJobs = 4;
     
     [Header("Debug")]
     public bool showDebugInfo = false;
     public int totalChunksLoaded = 0;
     public int totalVertices = 0;
     
+    // Components
+    public CaveNetworkPreprocessor networkPreprocessor;
+    private GPUChunkManager gpuChunkManager;
+    
     // Chunk management
-    private Dictionary<Vector3Int, Chunk> activeChunks = new Dictionary<Vector3Int, Chunk>();
-    private Queue<ChunkGenerationRequest> chunkGenerationQueue = new Queue<ChunkGenerationRequest>();
-    private Stack<Chunk> chunkPool = new Stack<Chunk>();
-    private List<ChunkJobData> activeJobs = new List<ChunkJobData>();
+    private Dictionary<Vector3Int, Chunk> chunks = new Dictionary<Vector3Int, Chunk>();
+    private Queue<Vector3Int> chunkGenerationQueue = new Queue<Vector3Int>();
+    private List<JobHandle> activeJobs = new List<JobHandle>();
     
-    // Cave network data
-    private NativeArray<float3> chamberCenters;
-    private List<CaveNetworkPreprocessor.TunnelData> tunnelNetwork;
-    
-    // Performance tracking
-    private float lastChunkUpdate = 0f;
-    private const float CHUNK_UPDATE_INTERVAL = 0.1f;
-    
-    private struct ChunkGenerationRequest
-    {
-        public Vector3Int coordinate;
-        public int lodLevel;
-    }
-    
-    private struct ChunkJobData
-    {
-        public Vector3Int coordinate;
-        public JobHandle jobHandle;
-        public NativeArray<float> voxelData;
-        public Chunk chunk;
-        public int lodLevel;
-        // Tunnel data arrays for disposal
-        public NativeArray<float3> allTunnelPoints;
-        public NativeArray<int> tunnelPointCounts;
-        public NativeArray<int> tunnelStartIndices;
-        public NativeArray<float> tunnelRadii;
-    }
+    // Player reference
+    private Transform player;
     
     void Start()
     {
-        InitializeCaveSettings();
-        
-        if (generateNetworkOnStart)
+        // Find player
+        player = GameObject.FindGameObjectWithTag("Player")?.transform;
+        if (player == null)
         {
-            GenerateCaveNetwork();
+            Debug.LogWarning("No player found! Tag your player GameObject with 'Player'");
         }
         
-        PrewarmChunkPool(50);
+        // Initialize components
+        if (networkPreprocessor == null)
+        {
+            networkPreprocessor = GetComponent<CaveNetworkPreprocessor>();
+        }
         
         if (useGPUGeneration)
         {
-            InitializeGPU();
-        }
-    }
-    
-    void InitializeCaveSettings()
-    {
-        UnityEngine.Random.InitState(caveSettings.seed);
-        caveSettings.noiseOffset = new float3(
-            UnityEngine.Random.Range(-1000f, 1000f),
-            UnityEngine.Random.Range(-1000f, 1000f),
-            UnityEngine.Random.Range(-1000f, 1000f)
-        );
-    }
-    
-    void GenerateCaveNetwork()
-    {
-        if (networkPreprocessor == null)
-        {
-            networkPreprocessor = gameObject.AddComponent<CaveNetworkPreprocessor>();
+            gpuChunkManager = GetComponent<GPUChunkManager>();
+            if (gpuChunkManager == null)
+            {
+                gpuChunkManager = gameObject.AddComponent<GPUChunkManager>();
+            }
         }
         
-        networkPreprocessor.GenerateCaveNetwork(caveSettings);
-        chamberCenters = networkPreprocessor.chamberCenters;
-        tunnelNetwork = networkPreprocessor.tunnelNetwork;
-        
-        UnityEngine.Debug.Log($"Generated cave network with {chamberCenters.Length} chambers and {tunnelNetwork.Count} tunnels");
-    }
-    
-    void PrewarmChunkPool(int count)
-    {
-        for (int i = 0; i < count; i++)
-        {
-            CreatePooledChunk();
-        }
+        // Generate initial chunks
+        UpdateChunks();
     }
     
     void Update()
     {
-        ProcessCompletedJobs();
-        
-        if (Time.time - lastChunkUpdate > CHUNK_UPDATE_INTERVAL)
+        if (player != null)
         {
-            UpdateChunksAroundPlayer();
-            lastChunkUpdate = Time.time;
+            UpdateChunks();
         }
         
-        ProcessChunkQueue();
+        // Process generation queue
+        ProcessGenerationQueue();
         
+        // Update debug info
         if (showDebugInfo)
         {
             UpdateDebugInfo();
         }
     }
     
-    void UpdateChunksAroundPlayer()
+    void UpdateChunks()
     {
-        if (player == null) return;
+        Vector3Int playerChunk = WorldToChunkCoord(player.position);
         
-        Vector3Int playerChunkCoord = WorldToChunkCoordinate(player.position);
+        // Check which chunks should exist
+        HashSet<Vector3Int> chunksToKeep = new HashSet<Vector3Int>();
         
-        // Queue chunks that need to be loaded
-        for (int x = -lodDistance; x <= lodDistance; x++)
+        for (int x = -renderDistance; x <= renderDistance; x++)
         {
-            for (int y = -viewDistance; y <= viewDistance; y++)
+            for (int y = -renderDistance; y <= renderDistance; y++)
             {
-                for (int z = -lodDistance; z <= lodDistance; z++)
+                for (int z = -renderDistance; z <= renderDistance; z++)
                 {
-                    Vector3Int chunkCoord = playerChunkCoord + new Vector3Int(x, y, z);
-                    float distance = Vector3.Distance(
-                        new Vector3(x, y, z), 
-                        Vector3.zero
-                    );
+                    Vector3Int chunkCoord = playerChunk + new Vector3Int(x, y, z);
+                    float distance = Vector3.Distance(player.position, ChunkToWorldPos(chunkCoord));
                     
-                    // Skip if too far
-                    if (distance > lodDistance) continue;
-                    
-                    // Skip if already loaded or queued
-                    if (activeChunks.ContainsKey(chunkCoord) || IsChunkQueued(chunkCoord))
-                        continue;
-                    
-                    // Determine LOD level
-                    int lodLevel = 0;
-                    if (enableLOD)
+                    if (distance <= renderDistance * chunkSize * voxelSize)
                     {
-                        if (distance > viewDistance)
-                            lodLevel = 1;
-                        if (distance > viewDistance * 1.5f)
-                            lodLevel = 2;
+                        chunksToKeep.Add(chunkCoord);
+                        
+                        // Generate chunk if it doesn't exist
+                        if (!chunks.ContainsKey(chunkCoord) && !chunkGenerationQueue.Contains(chunkCoord))
+                        {
+                            chunkGenerationQueue.Enqueue(chunkCoord);
+                        }
                     }
-                    
-                    // Queue for generation
-                    chunkGenerationQueue.Enqueue(new ChunkGenerationRequest
-                    {
-                        coordinate = chunkCoord,
-                        lodLevel = lodLevel
-                    });
                 }
             }
         }
         
-        // Unload distant chunks
-        List<Vector3Int> chunksToUnload = new List<Vector3Int>();
-        foreach (var kvp in activeChunks)
+        // Remove distant chunks
+        List<Vector3Int> chunksToRemove = new List<Vector3Int>();
+        foreach (var kvp in chunks)
         {
-            float distance = Vector3Int.Distance(kvp.Key, playerChunkCoord);
-            if (distance > lodDistance + unloadDistance)
+            if (!chunksToKeep.Contains(kvp.Key))
             {
-                chunksToUnload.Add(kvp.Key);
+                chunksToRemove.Add(kvp.Key);
             }
         }
         
-        foreach (var coord in chunksToUnload)
+        foreach (var coord in chunksToRemove)
         {
-            UnloadChunk(coord);
+            RemoveChunk(coord);
         }
     }
     
-    void ProcessChunkQueue()
+    void ProcessGenerationQueue()
     {
-        int jobsToStart = Mathf.Min(chunksPerFrame, maxConcurrentJobs - activeJobs.Count);
+        // Clean up completed jobs
+        activeJobs.RemoveAll(handle => handle.IsCompleted);
         
-        for (int i = 0; i < jobsToStart && chunkGenerationQueue.Count > 0; i++)
+        // Start new jobs
+        while (chunkGenerationQueue.Count > 0 && activeJobs.Count < maxConcurrentJobs)
         {
-            var request = chunkGenerationQueue.Dequeue();
+            Vector3Int chunkCoord = chunkGenerationQueue.Dequeue();
             
-            if (useGPUGeneration && gpuChunkManager != null)
+            if (useJobSystem && !useGPUGeneration)
             {
-                StartGPUChunkGeneration(request);
+                StartChunkGenerationJob(chunkCoord);
             }
-            else if (useJobSystem && chamberCenters.IsCreated)
+            else if (useGPUGeneration && gpuChunkManager != null)
             {
-                StartChunkGenerationJob(request);
+                GenerateChunkGPU(chunkCoord);
             }
             else
             {
-                GenerateChunkImmediate(request);
+                GenerateChunkImmediate(chunkCoord);
             }
         }
     }
     
-    void StartChunkGenerationJob(ChunkGenerationRequest request)
+    void StartChunkGenerationJob(Vector3Int chunkCoord)
     {
-        Chunk chunk = GetPooledChunk();
-        chunk.Initialize(request.coordinate, caveMaterial, request.lodLevel);
+        // Create chunk GameObject
+        GameObject chunkGO = Instantiate(chunkPrefab, ChunkToWorldPos(chunkCoord), Quaternion.identity);
+        Chunk chunk = chunkGO.GetComponent<Chunk>();
         
-        // Calculate voxel count including boundary
-        int voxelCount = (Chunk.CHUNK_SIZE + 1) * 
-                        (Chunk.CHUNK_SIZE + 1) * 
-                        (Chunk.CHUNK_SIZE + 1);
-        
-        NativeArray<float> voxelData = new NativeArray<float>(voxelCount, Allocator.TempJob);
-        
-        // Flatten tunnel data to avoid nested containers
-        NativeArray<float3> allTunnelPoints;
-        NativeArray<int> tunnelPointCounts;
-        NativeArray<int> tunnelStartIndices;
-        NativeArray<float> tunnelRadii;
-        
-        if (tunnelNetwork != null && tunnelNetwork.Count > 0)
+        if (chunk == null)
         {
-            // Count total points
-            int totalPoints = 0;
-            foreach (var tunnel in tunnelNetwork)
-            {
-                totalPoints += tunnel.pathPoints.Count;
-            }
-            
-            // Allocate arrays
-            allTunnelPoints = new NativeArray<float3>(totalPoints, Allocator.TempJob);
-            tunnelPointCounts = new NativeArray<int>(tunnelNetwork.Count, Allocator.TempJob);
-            tunnelStartIndices = new NativeArray<int>(tunnelNetwork.Count, Allocator.TempJob);
-            tunnelRadii = new NativeArray<float>(tunnelNetwork.Count, Allocator.TempJob);
-            
-            // Fill arrays
-            int currentIndex = 0;
-            for (int i = 0; i < tunnelNetwork.Count; i++)
-            {
-                var tunnel = tunnelNetwork[i];
-                tunnelStartIndices[i] = currentIndex;
-                tunnelPointCounts[i] = tunnel.pathPoints.Count;
-                tunnelRadii[i] = tunnel.radius;
-                
-                for (int j = 0; j < tunnel.pathPoints.Count; j++)
-                {
-                    allTunnelPoints[currentIndex++] = tunnel.pathPoints[j];
-                }
-            }
+            chunk = chunkGO.AddComponent<Chunk>();
+        }
+        
+        chunk.Initialize(chunkCoord, chunkSize, voxelSize);
+        chunks[chunkCoord] = chunk;
+        
+        // Prepare native arrays
+        int arraySize = (chunkSize + 1) * (chunkSize + 1) * (chunkSize + 1);
+        NativeArray<float> densityField = new NativeArray<float>(arraySize, Allocator.TempJob);
+        
+        // Create job with noise layer evaluation
+        var job = new CaveGenerationJobWithLayers
+        {
+            chunkCoord = new int3(chunkCoord.x, chunkCoord.y, chunkCoord.z),
+            chunkSize = chunkSize,
+            voxelSize = voxelSize,
+            settings = caveSettings,
+            densityField = densityField,
+            noiseLayerStack = ConvertNoiseStackToJobData(noiseLayerStack)
+        };
+        
+        // Add chamber data if available
+        if (networkPreprocessor != null && networkPreprocessor.chamberCenters.IsCreated)
+        {
+            job.chamberCenters = networkPreprocessor.chamberCenters;
         }
         else
         {
-            // Empty arrays
-            allTunnelPoints = new NativeArray<float3>(0, Allocator.TempJob);
-            tunnelPointCounts = new NativeArray<int>(0, Allocator.TempJob);
-            tunnelStartIndices = new NativeArray<int>(0, Allocator.TempJob);
-            tunnelRadii = new NativeArray<float>(0, Allocator.TempJob);
+            job.chamberCenters = new NativeArray<float3>(0, Allocator.TempJob);
         }
         
-        // Create and schedule job
-        var job = new CaveGenerationJob
-        {
-            chunkWorldPosition = new float3(
-                request.coordinate.x * Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE,
-                request.coordinate.y * Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE,
-                request.coordinate.z * Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE
-            ),
-            chunkSize = Chunk.CHUNK_SIZE,
-            voxelSize = Chunk.VOXEL_SIZE * (1 << request.lodLevel), // Larger voxels for LOD
-            settings = caveSettings,
-            chamberCenters = chamberCenters.IsCreated ? chamberCenters : new NativeArray<float3>(0, Allocator.TempJob),
-            allTunnelPoints = allTunnelPoints,
-            tunnelPointCounts = tunnelPointCounts,
-            tunnelStartIndices = tunnelStartIndices,
-            tunnelRadii = tunnelRadii,
-            voxelData = voxelData
-        };
+        // Schedule job
+        JobHandle handle = job.Schedule();
+        activeJobs.Add(handle);
         
-        JobHandle handle = job.Schedule(voxelCount, 64);
+        // Store handle in chunk for completion checking
+        chunk.generationHandle = handle;
+        chunk.densityField = densityField;
         
-        activeJobs.Add(new ChunkJobData
-        {
-            coordinate = request.coordinate,
-            jobHandle = handle,
-            voxelData = voxelData,
-            chunk = chunk,
-            lodLevel = request.lodLevel,
-            // Store tunnel arrays for disposal
-            allTunnelPoints = allTunnelPoints,
-            tunnelPointCounts = tunnelPointCounts,
-            tunnelStartIndices = tunnelStartIndices,
-            tunnelRadii = tunnelRadii
-        });
+        // Start coroutine to check completion
+        StartCoroutine(WaitForChunkGeneration(chunk, handle, densityField));
     }
     
-    void ProcessCompletedJobs()
+    System.Collections.IEnumerator WaitForChunkGeneration(Chunk chunk, JobHandle handle, NativeArray<float> densityData)
     {
-        for (int i = activeJobs.Count - 1; i >= 0; i--)
+        // Wait for job to complete
+        while (!handle.IsCompleted)
         {
-            var jobData = activeJobs[i];
-            
-            if (jobData.jobHandle.IsCompleted)
+            yield return null;
+        }
+        
+        handle.Complete();
+        
+        // Copy density data to chunk
+        chunk.SetDensityFromNativeArray(densityData);
+        
+        // Generate mesh
+        chunk.GenerateMesh();
+        
+        // Clean up native array
+        if (densityData.IsCreated)
+        {
+            densityData.Dispose();
+        }
+        
+        chunk.densityField = default;
+        chunk.generationHandle = null;
+    }
+    
+    void GenerateChunkGPU(Vector3Int chunkCoord)
+    {
+        if (gpuChunkManager != null)
+        {
+            gpuChunkManager.RequestChunk(new GPUChunkManager.GPUChunkRequest
             {
-                jobData.jobHandle.Complete();
-                
-                // Remove old chunk if updating LOD
-                if (activeChunks.ContainsKey(jobData.coordinate))
+                coordinate = chunkCoord,
+                lodLevel = 0,
+                onComplete = (meshData) =>
                 {
-                    UnloadChunk(jobData.coordinate);
+                    CreateChunkFromMeshData(chunkCoord, meshData);
                 }
-                
-                jobData.chunk.SetVoxelDataFromJob(jobData.voxelData);
-                jobData.chunk.GenerateSmoothMesh();
-                
-                // Dispose all native arrays
-                jobData.voxelData.Dispose();
-                if (jobData.allTunnelPoints.IsCreated) jobData.allTunnelPoints.Dispose();
-                if (jobData.tunnelPointCounts.IsCreated) jobData.tunnelPointCounts.Dispose();
-                if (jobData.tunnelStartIndices.IsCreated) jobData.tunnelStartIndices.Dispose();
-                if (jobData.tunnelRadii.IsCreated) jobData.tunnelRadii.Dispose();
-                
-                activeChunks[jobData.coordinate] = jobData.chunk;
-                activeJobs.RemoveAt(i);
+            });
+        }
+    }
+    
+    void GenerateChunkImmediate(Vector3Int chunkCoord)
+    {
+        GameObject chunkGO = Instantiate(chunkPrefab, ChunkToWorldPos(chunkCoord), Quaternion.identity);
+        Chunk chunk = chunkGO.GetComponent<Chunk>();
+        
+        if (chunk == null)
+        {
+            chunk = chunkGO.AddComponent<Chunk>();
+        }
+        
+        chunk.Initialize(chunkCoord, chunkSize, voxelSize);
+        
+        // Generate density field using noise layers
+        float[,,] densityField = new float[chunkSize + 1, chunkSize + 1, chunkSize + 1];
+        
+        for (int x = 0; x <= chunkSize; x++)
+        {
+            for (int y = 0; y <= chunkSize; y++)
+            {
+                for (int z = 0; z <= chunkSize; z++)
+                {
+                    Vector3 worldPos = ChunkToWorldPos(chunkCoord) + new Vector3(x, y, z) * voxelSize;
+                    densityField[x, y, z] = noiseLayerStack.EvaluateStack(worldPos);
+                }
             }
         }
+        
+        chunk.voxelData = densityField;
+        chunk.GenerateMesh();
+        
+        chunks[chunkCoord] = chunk;
+        totalChunksLoaded = chunks.Count;
     }
     
-    void GenerateChunkImmediate(ChunkGenerationRequest request)
+    void CreateChunkFromMeshData(Vector3Int chunkCoord, GPUChunkManager.ChunkMeshData meshData)
     {
-        Chunk chunk = GetPooledChunk();
-        chunk.Initialize(request.coordinate, caveMaterial, request.lodLevel);
+        GameObject chunkGO = Instantiate(chunkPrefab, ChunkToWorldPos(chunkCoord), Quaternion.identity);
+        Chunk chunk = chunkGO.GetComponent<Chunk>();
         
-        // For immediate generation, we'd need a non-job version
-        // This is simplified for the example
-        chunk.GenerateSmoothMesh();
-        
-        activeChunks[request.coordinate] = chunk;
-    }
-    
-    void UnloadChunk(Vector3Int coordinate)
-    {
-        if (activeChunks.TryGetValue(coordinate, out Chunk chunk))
+        if (chunk == null)
         {
-            chunk.gameObject.SetActive(false);
-            chunkPool.Push(chunk);
-            activeChunks.Remove(coordinate);
+            chunk = chunkGO.AddComponent<Chunk>();
+        }
+        
+        chunk.Initialize(chunkCoord, chunkSize, voxelSize);
+        chunk.SetMeshData(meshData.vertices, meshData.triangles, meshData.normals, meshData.uvs);
+        
+        chunks[chunkCoord] = chunk;
+        totalChunksLoaded = chunks.Count;
+    }
+    
+    void RemoveChunk(Vector3Int coord)
+    {
+        if (chunks.ContainsKey(coord))
+        {
+            Chunk chunk = chunks[coord];
+            totalVertices -= chunk.GetVertexCount();
+            
+            // Clean up any pending jobs
+            if (chunk.generationHandle.HasValue && !chunk.generationHandle.Value.IsCompleted)
+            {
+                chunk.generationHandle.Value.Complete();
+            }
+            
+            if (chunk.densityField.IsCreated)
+            {
+                chunk.densityField.Dispose();
+            }
+            
+            Destroy(chunk.gameObject);
+            chunks.Remove(coord);
+        }
+        
+        totalChunksLoaded = chunks.Count;
+    }
+    
+    public void ForceUpdateAllChunks()
+    {
+        // Clear and regenerate all chunks
+        List<Vector3Int> coordsToRegenerate = new List<Vector3Int>(chunks.Keys);
+        
+        foreach (var coord in coordsToRegenerate)
+        {
+            RemoveChunk(coord);
+            chunkGenerationQueue.Enqueue(coord);
         }
     }
     
-    Chunk GetPooledChunk()
-    {
-        if (chunkPool.Count > 0)
-        {
-            var chunk = chunkPool.Pop();
-            chunk.gameObject.SetActive(true);
-            return chunk;
-        }
-        
-        return CreatePooledChunk();
-    }
-    
-    Chunk CreatePooledChunk()
-    {
-        GameObject chunkObj = new GameObject("Cave Chunk");
-        chunkObj.transform.parent = transform;
-        Chunk chunk = chunkObj.AddComponent<Chunk>();
-        return chunk;
-    }
-    
-    Vector3Int WorldToChunkCoordinate(Vector3 worldPos)
+    Vector3Int WorldToChunkCoord(Vector3 worldPos)
     {
         return new Vector3Int(
-            Mathf.FloorToInt(worldPos.x / (Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE)),
-            Mathf.FloorToInt(worldPos.y / (Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE)),
-            Mathf.FloorToInt(worldPos.z / (Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE))
+            Mathf.FloorToInt(worldPos.x / (chunkSize * voxelSize)),
+            Mathf.FloorToInt(worldPos.y / (chunkSize * voxelSize)),
+            Mathf.FloorToInt(worldPos.z / (chunkSize * voxelSize))
         );
     }
     
-    bool IsChunkQueued(Vector3Int coord)
+    Vector3 ChunkToWorldPos(Vector3Int chunkCoord)
     {
-        foreach (var request in chunkGenerationQueue)
-        {
-            if (request.coordinate == coord) return true;
-        }
-        
-        foreach (var job in activeJobs)
-        {
-            if (job.coordinate == coord) return true;
-        }
-        
-        return false;
+        return new Vector3(
+            chunkCoord.x * chunkSize * voxelSize,
+            chunkCoord.y * chunkSize * voxelSize,
+            chunkCoord.z * chunkSize * voxelSize
+        );
     }
     
     void UpdateDebugInfo()
     {
-        totalChunksLoaded = activeChunks.Count;
         totalVertices = 0;
-        
-        foreach (var chunk in activeChunks.Values)
+        foreach (var chunk in chunks.Values)
         {
-            var meshFilter = chunk.GetComponent<MeshFilter>();
-            if (meshFilter && meshFilter.mesh)
-            {
-                totalVertices += meshFilter.mesh.vertexCount;
-            }
+            totalVertices += chunk.GetVertexCount();
         }
     }
     
-    // GPU Generation Methods
-    void InitializeGPU()
+    // Convert noise stack to job-friendly data
+    JobNoiseLayerStack ConvertNoiseStackToJobData(NoiseLayerStack stack)
     {
-        if (gpuChunkManager == null)
+        var jobStack = new JobNoiseLayerStack();
+        jobStack.layerCount = stack.layers.Count;
+        
+        // Allocate arrays for layer data
+        jobStack.enabled = new NativeArray<bool>(stack.layers.Count, Allocator.TempJob);
+        jobStack.noiseTypes = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
+        jobStack.blendModes = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
+        jobStack.frequencies = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.amplitudes = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.octaves = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
+        jobStack.persistences = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.lacunarities = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.offsets = new NativeArray<float3>(stack.layers.Count, Allocator.TempJob);
+        jobStack.verticalSquashes = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.densityBiases = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        jobStack.powers = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        
+        // Copy layer data
+        for (int i = 0; i < stack.layers.Count; i++)
         {
-            UnityEngine.Debug.LogError("GPU Chunk Manager not assigned to WorldManager!");
-            return;
+            var layer = stack.layers[i];
+            jobStack.enabled[i] = layer.enabled;
+            jobStack.noiseTypes[i] = (int)layer.noiseType;
+            jobStack.blendModes[i] = (int)layer.blendMode;
+            jobStack.frequencies[i] = layer.frequency;
+            jobStack.amplitudes[i] = layer.amplitude;
+            jobStack.octaves[i] = layer.octaves;
+            jobStack.persistences[i] = layer.persistence;
+            jobStack.lacunarities[i] = layer.lacunarity;
+            jobStack.offsets[i] = layer.offset;
+            jobStack.verticalSquashes[i] = layer.verticalSquash;
+            jobStack.densityBiases[i] = layer.densityBias;
+            jobStack.powers[i] = layer.power;
         }
         
-        // Initialize the GPU chunk manager if it has specific initialization needs
-        // The GPUChunkManager's Start() method already handles initialization,
-        // but you can add any additional setup here if needed
-        
-        UnityEngine.Debug.Log("GPU acceleration initialized for cave generation");
-    }
-    
-    void StartGPUChunkGeneration(ChunkGenerationRequest request)
-    {
-        if (!useGPUGeneration || gpuChunkManager == null)
-        {
-            UnityEngine.Debug.LogWarning("GPU generation requested but not available");
-            return;
-        }
-        
-        // Convert the chunk generation request to GPU chunk request format
-        GPUChunkManager.GPUChunkRequest gpuRequest = new GPUChunkManager.GPUChunkRequest
-        {
-            coordinate = request.coordinate,
-            lodLevel = request.lodLevel,
-            onComplete = (meshData) => OnGPUChunkComplete(request.coordinate, meshData, request.lodLevel)
-        };
-        
-        // Submit the request to the GPU chunk manager
-        gpuChunkManager.RequestChunk(gpuRequest);
-    }
-    
-    void OnGPUChunkComplete(Vector3Int coordinate, GPUChunkManager.ChunkMeshData meshData, int lodLevel)
-    {
-        // Get or create the chunk
-        Chunk chunk = GetOrCreateChunk(coordinate, lodLevel);
-        
-        if (chunk != null && meshData.vertices.Length > 0)
-        {
-            // Get the mesh filter component
-            MeshFilter chunkMeshFilter = chunk.GetComponent<MeshFilter>();
-            if (chunkMeshFilter != null)
-            {
-                // Create or get mesh
-                if (chunkMeshFilter.mesh == null)
-                {
-                    chunkMeshFilter.mesh = new Mesh();
-                    chunkMeshFilter.mesh.name = $"Chunk_{coordinate}";
-                }
-                
-                // Apply the mesh data to the chunk
-                chunkMeshFilter.mesh.Clear();
-                chunkMeshFilter.mesh.vertices = meshData.vertices;
-                chunkMeshFilter.mesh.triangles = meshData.triangles;
-                chunkMeshFilter.mesh.normals = meshData.normals;
-                chunkMeshFilter.mesh.uv = meshData.uvs;
-                chunkMeshFilter.mesh.RecalculateBounds();
-            }
-            
-            // Update statistics
-            totalVertices += meshData.vertices.Length;
-        }
-    }
-    
-    Chunk GetOrCreateChunk(Vector3Int coordinate, int lodLevel)
-    {
-        if (activeChunks.TryGetValue(coordinate, out Chunk existingChunk))
-        {
-            return existingChunk;
-        }
-        
-        // Get chunk from pool or create new
-        Chunk chunk = GetPooledChunk();
-        chunk.Initialize(coordinate, caveMaterial, lodLevel);
-        activeChunks[coordinate] = chunk;
-        
-        return chunk;
+        return jobStack;
     }
     
     void OnDestroy()
     {
-        foreach (var job in activeJobs)
+        // Complete all jobs
+        foreach (var handle in activeJobs)
         {
-            job.jobHandle.Complete();
-            job.voxelData.Dispose();
-            if (job.allTunnelPoints.IsCreated) job.allTunnelPoints.Dispose();
-            if (job.tunnelPointCounts.IsCreated) job.tunnelPointCounts.Dispose();
-            if (job.tunnelStartIndices.IsCreated) job.tunnelStartIndices.Dispose();
-            if (job.tunnelRadii.IsCreated) job.tunnelRadii.Dispose();
+            if (!handle.IsCompleted)
+            {
+                handle.Complete();
+            }
         }
         
-        if (chamberCenters.IsCreated)
-            chamberCenters.Dispose();
+        // Clean up chunks
+        foreach (var chunk in chunks.Values)
+        {
+            if (chunk.densityField.IsCreated)
+            {
+                chunk.densityField.Dispose();
+            }
+        }
     }
     
     void OnDrawGizmosSelected()
     {
-        if (!showDebugInfo || player == null) return;
+        if (!showDebugInfo) return;
         
-        Vector3Int playerChunk = WorldToChunkCoordinate(player.position);
-        float chunkWorldSize = Chunk.CHUNK_SIZE * Chunk.VOXEL_SIZE;
-        
-        Vector3 center = new Vector3(
-            playerChunk.x * chunkWorldSize + chunkWorldSize / 2f,
-            playerChunk.y * chunkWorldSize + chunkWorldSize / 2f,
-            playerChunk.z * chunkWorldSize + chunkWorldSize / 2f
-        );
-        
-        // Draw view distance (green)
-        Gizmos.color = Color.green;
-        Gizmos.DrawWireCube(center, Vector3.one * chunkWorldSize * (viewDistance * 2 + 1));
-        
-        // Draw LOD distance (yellow)
-        if (enableLOD)
+        // Draw chunk boundaries
+        Gizmos.color = Color.yellow;
+        foreach (var coord in chunks.Keys)
         {
-            Gizmos.color = Color.yellow;
-            Gizmos.DrawWireCube(center, Vector3.one * chunkWorldSize * (lodDistance * 2 + 1));
+            Vector3 center = ChunkToWorldPos(coord) + Vector3.one * chunkSize * voxelSize * 0.5f;
+            Gizmos.DrawWireCube(center, Vector3.one * chunkSize * voxelSize);
         }
         
-        // Draw unload distance (red)
-        Gizmos.color = Color.red;
-        Gizmos.DrawWireCube(center, Vector3.one * chunkWorldSize * ((lodDistance + unloadDistance) * 2 + 1));
-        
-        // Draw chamber centers if available
-        if (chamberCenters.IsCreated)
+        // Draw player position
+        if (player != null)
         {
-            Gizmos.color = Color.cyan;
-            foreach (var chamber in chamberCenters)
-            {
-                Gizmos.DrawWireSphere(chamber, 2f);
-            }
+            Gizmos.color = Color.green;
+            Gizmos.DrawWireSphere(player.position, 1f);
         }
     }
 }
