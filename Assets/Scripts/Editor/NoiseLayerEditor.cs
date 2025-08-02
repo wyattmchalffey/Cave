@@ -8,6 +8,8 @@ public class NoiseLayerDrawer : PropertyDrawer
 {
     private const int PREVIEW_SIZE = 128;
     private static Dictionary<string, bool> foldoutStates = new Dictionary<string, bool>();
+    private static Dictionary<string, Texture2D> previewCache = new Dictionary<string, Texture2D>();
+    private static Dictionary<string, int> lastUpdateFrame = new Dictionary<string, int>();
     
     public override float GetPropertyHeight(SerializedProperty property, GUIContent label)
     {
@@ -125,12 +127,6 @@ public class NoiseLayerDrawer : PropertyDrawer
                 // Generate and display preview texture
                 Rect previewRect = new Rect(position.x + EditorGUI.indentLevel * 15, y, PREVIEW_SIZE, PREVIEW_SIZE);
                 DrawNoisePreview(property, previewRect);
-                
-                // Add refresh button
-                if (GUI.Button(new Rect(previewRect.x + PREVIEW_SIZE + 10, previewRect.y, 60, 20), "Refresh"))
-                {
-                    property.serializedObject.ApplyModifiedProperties();
-                }
             }
             
             EditorGUI.indentLevel = indent;
@@ -152,14 +148,67 @@ public class NoiseLayerDrawer : PropertyDrawer
     
     private void DrawNoisePreview(SerializedProperty property, Rect rect)
     {
-        // Get or create preview texture
-        var previewTexture = GetPreviewTexture(property);
-        if (previewTexture != null)
+        string cacheKey = property.propertyPath;
+        
+        // Check if we need to update the preview
+        bool needsUpdate = false;
+        
+        // Check if texture exists in cache
+        if (!previewCache.ContainsKey(cacheKey) || previewCache[cacheKey] == null)
         {
-            EditorGUI.DrawPreviewTexture(rect, previewTexture);
+            needsUpdate = true;
+        }
+        else
+        {
+            // Only update if property has changed (check every 30 frames)
+            int currentFrame = Time.frameCount;
+            if (!lastUpdateFrame.ContainsKey(cacheKey))
+            {
+                lastUpdateFrame[cacheKey] = currentFrame;
+                needsUpdate = true;
+            }
+            else if (currentFrame - lastUpdateFrame[cacheKey] > 30)
+            {
+                lastUpdateFrame[cacheKey] = currentFrame;
+                if (GUI.changed || property.serializedObject.hasModifiedProperties)
+                {
+                    needsUpdate = true;
+                }
+            }
+        }
+        
+        // Generate texture if needed
+        if (needsUpdate)
+        {
+            var texture = GetPreviewTexture(property);
+            if (texture != null)
+            {
+                previewCache[cacheKey] = texture;
+            }
+        }
+        
+        // Draw cached texture
+        if (previewCache.ContainsKey(cacheKey) && previewCache[cacheKey] != null)
+        {
+            EditorGUI.DrawPreviewTexture(rect, previewCache[cacheKey]);
             
             // Draw border
             GUI.Box(rect, GUIContent.none);
+        }
+        
+        // Add manual refresh button
+        if (GUI.Button(new Rect(rect.x + PREVIEW_SIZE + 10, rect.y, 60, 20), "Refresh"))
+        {
+            if (previewCache.ContainsKey(cacheKey) && previewCache[cacheKey] != null)
+            {
+                UnityEngine.Object.DestroyImmediate(previewCache[cacheKey]);
+            }
+            var texture = GetPreviewTexture(property);
+            if (texture != null)
+            {
+                previewCache[cacheKey] = texture;
+            }
+            property.serializedObject.ApplyModifiedProperties();
         }
     }
     
@@ -222,6 +271,33 @@ public class NoiseLayerDrawer : PropertyDrawer
         texture.Apply();
         
         return texture;
+    }
+    
+    // Static cleanup method
+    static NoiseLayerDrawer()
+    {
+        // Clean up textures when scripts reload or play mode changes
+        EditorApplication.playModeStateChanged += (state) =>
+        {
+            if (state == PlayModeStateChange.ExitingEditMode || 
+                state == PlayModeStateChange.ExitingPlayMode)
+            {
+                CleanupPreviewCache();
+            }
+        };
+    }
+    
+    private static void CleanupPreviewCache()
+    {
+        foreach (var kvp in previewCache)
+        {
+            if (kvp.Value != null)
+            {
+                UnityEngine.Object.DestroyImmediate(kvp.Value);
+            }
+        }
+        previewCache.Clear();
+        lastUpdateFrame.Clear();
     }
 }
 
@@ -319,8 +395,8 @@ public class WorldManagerNoiseEditor : Editor
         {
             EditorUtility.SetDirty(worldManager);
             
-            // Force chunk updates if in play mode
-            if (Application.isPlaying)
+            // Force chunk updates if in play mode (throttled)
+            if (Application.isPlaying && Time.frameCount % 10 == 0)
             {
                 worldManager.ForceUpdateAllChunks();
             }
@@ -371,12 +447,19 @@ public class WorldManagerNoiseEditor : Editor
         EditorGUILayout.EndHorizontal();
         
         // Draw layer properties (the property drawer will handle this)
+        EditorGUI.BeginChangeCheck();
+        
         var so = new SerializedObject(worldManager);
         var layersProp = so.FindProperty("noiseLayerStack").FindPropertyRelative("layers");
         var layerProp = layersProp.GetArrayElementAtIndex(index);
         
         EditorGUILayout.PropertyField(layerProp, GUIContent.none);
-        so.ApplyModifiedProperties();
+        
+        if (EditorGUI.EndChangeCheck())
+        {
+            so.ApplyModifiedProperties();
+            EditorUtility.SetDirty(worldManager);
+        }
         
         EditorGUILayout.EndVertical();
         EditorGUILayout.Space();

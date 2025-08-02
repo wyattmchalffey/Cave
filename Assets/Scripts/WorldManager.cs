@@ -36,6 +36,7 @@ public class WorldManager : MonoBehaviour
     private Dictionary<Vector3Int, Chunk> chunks = new Dictionary<Vector3Int, Chunk>();
     private Queue<Vector3Int> chunkGenerationQueue = new Queue<Vector3Int>();
     private List<JobHandle> activeJobs = new List<JobHandle>();
+    private Dictionary<Vector3Int, Coroutine> chunkCoroutines = new Dictionary<Vector3Int, Coroutine>();
     
     // Player reference
     private Transform player;
@@ -203,34 +204,77 @@ public class WorldManager : MonoBehaviour
         chunk.generationHandle = handle;
         chunk.densityField = densityField;
         
-        // Start coroutine to check completion
-        StartCoroutine(WaitForChunkGeneration(chunk, handle, densityField));
+        // Start coroutine to check completion and track it
+        var coroutine = StartCoroutine(WaitForChunkGeneration(chunk, handle, densityField));
+        chunkCoroutines[chunkCoord] = coroutine;
     }
     
     System.Collections.IEnumerator WaitForChunkGeneration(Chunk chunk, JobHandle handle, NativeArray<float> densityData)
     {
-        // Wait for job to complete
-        while (!handle.IsCompleted)
+        // Store chunk coordinate to check if it still exists
+        Vector3Int chunkCoord = chunk.coordinate;
+        
+        try
         {
-            yield return null;
+            // Wait for job to complete
+            while (!handle.IsCompleted)
+            {
+                yield return null;
+                
+                // Check if chunk was removed while we were waiting
+                if (!chunks.ContainsKey(chunkCoord))
+                {
+                    // Complete and dispose immediately
+                    handle.Complete();
+                    if (densityData.IsCreated)
+                    {
+                        densityData.Dispose();
+                    }
+                    yield break;
+                }
+            }
+            
+            handle.Complete();
+            
+            // Double-check chunk still exists
+            if (!chunks.ContainsKey(chunkCoord) || chunk == null)
+            {
+                if (densityData.IsCreated)
+                {
+                    densityData.Dispose();
+                }
+                yield break;
+            }
+            
+            // Copy density data to chunk
+            if (densityData.IsCreated)
+            {
+                chunk.SetDensityFromNativeArray(densityData);
+                
+                // Generate mesh
+                chunk.GenerateMesh();
+                
+                // Clean up native array
+                densityData.Dispose();
+                chunk.densityField = default;
+            }
+            
+            chunk.generationHandle = null;
         }
-        
-        handle.Complete();
-        
-        // Copy density data to chunk
-        chunk.SetDensityFromNativeArray(densityData);
-        
-        // Generate mesh
-        chunk.GenerateMesh();
-        
-        // Clean up native array
-        if (densityData.IsCreated)
+        finally
         {
-            densityData.Dispose();
+            // Ensure cleanup happens even if coroutine is interrupted
+            if (handle.IsCompleted && densityData.IsCreated)
+            {
+                densityData.Dispose();
+            }
+            
+            // Remove coroutine tracking
+            if (chunkCoroutines.ContainsKey(chunkCoord))
+            {
+                chunkCoroutines.Remove(chunkCoord);
+            }
         }
-        
-        chunk.densityField = default;
-        chunk.generationHandle = null;
     }
     
     void GenerateChunkGPU(Vector3Int chunkCoord)
@@ -305,18 +349,30 @@ public class WorldManager : MonoBehaviour
         if (chunks.ContainsKey(coord))
         {
             Chunk chunk = chunks[coord];
-            totalVertices -= chunk.GetVertexCount();
             
-            // Clean up any pending jobs
-            if (chunk.generationHandle.HasValue && !chunk.generationHandle.Value.IsCompleted)
+            // Stop generation coroutine for this specific chunk
+            if (chunkCoroutines.ContainsKey(coord))
             {
-                chunk.generationHandle.Value.Complete();
+                StopCoroutine(chunkCoroutines[coord]);
+                chunkCoroutines.Remove(coord);
             }
             
+            // Complete any pending jobs immediately BEFORE disposing arrays
+            if (chunk.generationHandle.HasValue)
+            {
+                // Force complete the job
+                chunk.generationHandle.Value.Complete();
+                chunk.generationHandle = null;
+            }
+            
+            // Now safe to clean up native arrays
             if (chunk.densityField.IsCreated)
             {
                 chunk.densityField.Dispose();
+                chunk.densityField = default;
             }
+            
+            totalVertices -= chunk.GetVertexCount();
             
             Destroy(chunk.gameObject);
             chunks.Remove(coord);
@@ -407,7 +463,10 @@ public class WorldManager : MonoBehaviour
     
     void OnDestroy()
     {
-        // Complete all jobs
+        // Stop all coroutines
+        StopAllCoroutines();
+        
+        // Complete all active jobs first
         foreach (var handle in activeJobs)
         {
             if (!handle.IsCompleted)
@@ -415,8 +474,19 @@ public class WorldManager : MonoBehaviour
                 handle.Complete();
             }
         }
+        activeJobs.Clear();
         
-        // Clean up chunks
+        // Complete any chunk-specific jobs
+        foreach (var chunk in chunks.Values)
+        {
+            if (chunk.generationHandle.HasValue)
+            {
+                chunk.generationHandle.Value.Complete();
+                chunk.generationHandle = null;
+            }
+        }
+        
+        // Now safe to dispose native arrays
         foreach (var chunk in chunks.Values)
         {
             if (chunk.densityField.IsCreated)

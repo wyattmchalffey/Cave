@@ -134,7 +134,7 @@ GameObject:
   - component: {fileID: 330585548}
   m_Layer: 0
   m_Name: Main Camera
-  m_TagString: MainCamera
+  m_TagString: Player
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
@@ -442,7 +442,7 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1 &1306380667
+--- !u!1 &1274155584
 GameObject:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -450,22 +450,148 @@ GameObject:
   m_PrefabAsset: {fileID: 0}
   serializedVersion: 6
   m_Component:
-  - component: {fileID: 1306380669}
-  - component: {fileID: 1306380668}
+  - component: {fileID: 1274155588}
+  - component: {fileID: 1274155587}
+  - component: {fileID: 1274155586}
+  - component: {fileID: 1274155585}
   m_Layer: 0
-  m_Name: Network Processor
+  m_Name: World
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
   m_IsActive: 1
---- !u!114 &1306380668
+--- !u!114 &1274155585
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1306380667}
+  m_GameObject: {fileID: 1274155584}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 17a2cb57c7daa284ca0dd5e83723d42e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  chunkPrefab: {fileID: 2154297048571110583, guid: ae2f5833eedeacf49863fe6cef6036d4, type: 3}
+  renderDistance: 5
+  chunkSize: 32
+  voxelSize: 0.25
+  caveSettings:
+    chamberFrequency: 0.02
+    chamberMinRadius: 8
+    chamberMaxRadius: 20
+    chamberFloorFlatness: 0.7
+    chamberVerticalScale: 0.6
+    tunnelMinRadius: 2
+    tunnelMaxRadius: 4
+    tunnelCurvature: 0.3
+    tunnelFrequency: 0.05
+    tunnelConnectionsPerChamber: 3
+    stratificationStrength: 0.15
+    stratificationFrequency: 0.1
+    erosionStrength: 0.3
+    rockHardness: 0.5
+    seed: 42
+    noiseOffset:
+      x: 0
+      y: 0
+      z: 0
+    worleyOctaves: 2
+    worleyPersistence: 0.5
+    minCaveHeight: -50
+    maxCaveHeight: 50
+    surfaceTransitionHeight: 40
+  noiseLayerStack:
+    layers:
+    - layerName: Main Caverns
+      enabled: 1
+      noiseType: 0
+      blendMode: 0
+      frequency: 0.034
+      amplitude: 1.98
+      octaves: 3
+      persistence: 0.5
+      lacunarity: 2
+      offset:
+        x: 0
+        y: 0
+        z: 0
+      verticalSquash: 0.3
+      densityBias: 0
+      power: 1
+      useHeightConstraints: 0
+      minHeight: -50
+      maxHeight: 50
+      heightFalloff:
+        serializedVersion: 2
+        m_Curve:
+        - serializedVersion: 3
+          time: 0
+          value: 1
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        - serializedVersion: 3
+          time: 1
+          value: 1
+          inSlope: 0
+          outSlope: 0
+          tangentMode: 0
+          weightedMode: 0
+          inWeight: 0
+          outWeight: 0
+        m_PreInfinity: 2
+        m_PostInfinity: 2
+        m_RotationOrder: 4
+      showPreview: 1
+      previewGradient:
+        serializedVersion: 2
+        key0: {r: 0, g: 0, b: 0, a: 1}
+        key1: {r: 1, g: 1, b: 1, a: 1}
+        key2: {r: 0, g: 0, b: 0, a: 0}
+        key3: {r: 0, g: 0, b: 0, a: 0}
+        key4: {r: 0, g: 0, b: 0, a: 0}
+        key5: {r: 0, g: 0, b: 0, a: 0}
+        key6: {r: 0, g: 0, b: 0, a: 0}
+        key7: {r: 0, g: 0, b: 0, a: 0}
+        ctime0: 0
+        ctime1: 65535
+        ctime2: 0
+        ctime3: 0
+        ctime4: 0
+        ctime5: 0
+        ctime6: 0
+        ctime7: 0
+        atime0: 0
+        atime1: 65535
+        atime2: 0
+        atime3: 0
+        atime4: 0
+        atime5: 0
+        atime6: 0
+        atime7: 0
+        m_Mode: 0
+        m_ColorSpace: -1
+        m_NumColorKeys: 2
+        m_NumAlphaKeys: 2
+  useJobSystem: 1
+  useGPUGeneration: 0
+  maxConcurrentJobs: 4
+  showDebugInfo: 0
+  totalChunksLoaded: 0
+  totalVertices: 0
+  networkPreprocessor: {fileID: 0}
+--- !u!114 &1274155586
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1274155584}
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: ca30560faae917d4a86c765a25ff10ea, type: 3}
@@ -478,56 +604,20 @@ MonoBehaviour:
     z: 1000
   chamberCount: 50
   maxTunnelsPerChamber: 4
---- !u!4 &1306380669
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1306380667}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -8.09127, y: 0, z: 0.34215}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!1 &1904636617
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1904636619}
-  - component: {fileID: 1904636618}
-  - component: {fileID: 1904636620}
-  m_Layer: 0
-  m_Name: World
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!114 &1904636618
+--- !u!114 &1274155587
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1904636617}
+  m_GameObject: {fileID: 1274155584}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 17a2cb57c7daa284ca0dd5e83723d42e, type: 3}
+  m_Script: {fileID: 11500000, guid: 614bab117f97460438b88435c51a0cb0, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  player: {fileID: 330585546}
-  viewDistance: 5
-  lodDistance: 8
-  unloadDistance: 2
-  chunksPerFrame: 10
+  noiseGenerationShader: {fileID: 7200000, guid: b53b12945f0f91744818c70db74ca802, type: 3}
+  meshGenerationShader: {fileID: 7200000, guid: d39ff92d9d4c5704eab1b0eae26b06a9, type: 3}
   caveSettings:
     chamberFrequency: 0.02
     chamberMinRadius: 8
@@ -554,75 +644,22 @@ MonoBehaviour:
     maxCaveHeight: 50
     surfaceTransitionHeight: 40
   caveMaterial: {fileID: 2100000, guid: 97ebab7fd75682045b62c72a2e1ba00f, type: 2}
-  useJobSystem: 1
-  maxConcurrentJobs: 4
-  enableLOD: 1
-  generateNetworkOnStart: 1
-  networkPreprocessor: {fileID: 1306380668}
-  useGPUGeneration: 1
-  gpuChunkManager: {fileID: 1904636620}
-  caveGenerationShader: {fileID: 7200000, guid: 6b193e99900fab240b962f129db749f3, type: 3}
-  meshGenerationShader: {fileID: 7200000, guid: 93dc92474b49f6e4f8e1dc7aa3081c4b, type: 3}
-  showDebugInfo: 0
-  totalChunksLoaded: 0
-  totalVertices: 0
---- !u!4 &1904636619
+  showNoisePreview: 0
+--- !u!4 &1274155588
 Transform:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1904636617}
+  m_GameObject: {fileID: 1274155584}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalPosition: {x: -96.41006, y: 0, z: 21.11686}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &1904636620
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1904636617}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 614bab117f97460438b88435c51a0cb0, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  caveGenerationShader: {fileID: 7200000, guid: 6b193e99900fab240b962f129db749f3, type: 3}
-  meshGenerationShader: {fileID: 7200000, guid: 93dc92474b49f6e4f8e1dc7aa3081c4b, type: 3}
-  caveSettings:
-    chamberFrequency: 0
-    chamberMinRadius: 0
-    chamberMaxRadius: 0
-    chamberFloorFlatness: 0
-    chamberVerticalScale: 0
-    tunnelMinRadius: 0
-    tunnelMaxRadius: 0
-    tunnelCurvature: 0
-    tunnelFrequency: 0
-    tunnelConnectionsPerChamber: 0
-    stratificationStrength: 0
-    stratificationFrequency: 0
-    erosionStrength: 0
-    rockHardness: 0
-    seed: 0
-    noiseOffset:
-      x: 0
-      y: 0
-      z: 0
-    worleyOctaves: 0
-    worleyPersistence: 0
-    minCaveHeight: 0
-    maxCaveHeight: 0
-    surfaceTransitionHeight: 0
-  caveMaterial: {fileID: 2100000, guid: 97ebab7fd75682045b62c72a2e1ba00f, type: 2}
-  useDebugKernel: 1
-  logDensityStats: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -630,5 +667,4 @@ SceneRoots:
   - {fileID: 330585546}
   - {fileID: 410087041}
   - {fileID: 832575519}
-  - {fileID: 1904636619}
-  - {fileID: 1306380669}
+  - {fileID: 1274155588}
