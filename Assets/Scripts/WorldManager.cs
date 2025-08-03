@@ -29,12 +29,11 @@ public class WorldManager : MonoBehaviour
     public int totalVertices = 0;
     
     // Components
-    public CaveNetworkPreprocessor networkPreprocessor;
     private GPUChunkManager gpuChunkManager;
     
     // Chunk management
-    private Dictionary<Vector3Int, Chunk> chunks = new Dictionary<Vector3Int, Chunk>();
-    private Queue<Vector3Int> chunkGenerationQueue = new Queue<Vector3Int>();
+    public Dictionary<Vector3Int, Chunk> chunks { get; private set; } = new Dictionary<Vector3Int, Chunk>();
+    public Queue<Vector3Int> chunkGenerationQueue { get; private set; } = new Queue<Vector3Int>();
     private List<JobHandle> activeJobs = new List<JobHandle>();
     private Dictionary<Vector3Int, Coroutine> chunkCoroutines = new Dictionary<Vector3Int, Coroutine>();
     
@@ -48,12 +47,6 @@ public class WorldManager : MonoBehaviour
         if (player == null)
         {
             Debug.LogWarning("No player found! Tag your player GameObject with 'Player'");
-        }
-        
-        // Initialize components
-        if (networkPreprocessor == null)
-        {
-            networkPreprocessor = GetComponent<CaveNetworkPreprocessor>();
         }
         
         if (useGPUGeneration)
@@ -86,7 +79,7 @@ public class WorldManager : MonoBehaviour
         }
     }
     
-    void UpdateChunks()
+    public void UpdateChunks()
     {
         Vector3Int playerChunk = WorldToChunkCoord(player.position);
         
@@ -185,16 +178,6 @@ public class WorldManager : MonoBehaviour
             densityField = densityField,
             noiseLayerStack = ConvertNoiseStackToJobData(noiseLayerStack)
         };
-        
-        // Add chamber data if available
-        if (networkPreprocessor != null && networkPreprocessor.chamberCenters.IsCreated)
-        {
-            job.chamberCenters = networkPreprocessor.chamberCenters;
-        }
-        else
-        {
-            job.chamberCenters = new NativeArray<float3>(0, Allocator.TempJob);
-        }
         
         // Schedule job
         JobHandle handle = job.Schedule();
@@ -344,7 +327,7 @@ public class WorldManager : MonoBehaviour
         totalChunksLoaded = chunks.Count;
     }
     
-    void RemoveChunk(Vector3Int coord)
+    public void RemoveChunk(Vector3Int coord)
     {
         if (chunks.ContainsKey(coord))
         {
@@ -424,23 +407,26 @@ public class WorldManager : MonoBehaviour
     JobNoiseLayerStack ConvertNoiseStackToJobData(NoiseLayerStack stack)
     {
         var jobStack = new JobNoiseLayerStack();
-        jobStack.layerCount = stack.layers.Count;
         
-        // Allocate arrays for layer data
-        jobStack.enabled = new NativeArray<bool>(stack.layers.Count, Allocator.TempJob);
-        jobStack.noiseTypes = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
-        jobStack.blendModes = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
-        jobStack.frequencies = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.amplitudes = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.octaves = new NativeArray<int>(stack.layers.Count, Allocator.TempJob);
-        jobStack.persistences = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.lacunarities = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.offsets = new NativeArray<float3>(stack.layers.Count, Allocator.TempJob);
-        jobStack.verticalSquashes = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.densityBiases = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
-        jobStack.powers = new NativeArray<float>(stack.layers.Count, Allocator.TempJob);
+        // Ensure we have at least one layer
+        int layerCount = Mathf.Max(1, stack.layers.Count);
+        jobStack.layerCount = stack.layers.Count; // Actual count, can be 0
         
-        // Copy layer data
+        // Allocate arrays with at least 1 element to avoid index out of range
+        jobStack.enabled = new NativeArray<bool>(layerCount, Allocator.TempJob);
+        jobStack.noiseTypes = new NativeArray<int>(layerCount, Allocator.TempJob);
+        jobStack.blendModes = new NativeArray<int>(layerCount, Allocator.TempJob);
+        jobStack.frequencies = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.amplitudes = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.octaves = new NativeArray<int>(layerCount, Allocator.TempJob);
+        jobStack.persistences = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.lacunarities = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.offsets = new NativeArray<float3>(layerCount, Allocator.TempJob);
+        jobStack.verticalSquashes = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.densityBiases = new NativeArray<float>(layerCount, Allocator.TempJob);
+        jobStack.powers = new NativeArray<float>(layerCount, Allocator.TempJob);
+        
+        // Copy layer data if we have any
         for (int i = 0; i < stack.layers.Count; i++)
         {
             var layer = stack.layers[i];
@@ -456,6 +442,23 @@ public class WorldManager : MonoBehaviour
             jobStack.verticalSquashes[i] = layer.verticalSquash;
             jobStack.densityBiases[i] = layer.densityBias;
             jobStack.powers[i] = layer.power;
+        }
+        
+        // If no layers, set default values for the dummy element
+        if (stack.layers.Count == 0)
+        {
+            jobStack.enabled[0] = false;
+            jobStack.noiseTypes[0] = 0;
+            jobStack.blendModes[0] = 0;
+            jobStack.frequencies[0] = 0.02f;
+            jobStack.amplitudes[0] = 0f;
+            jobStack.octaves[0] = 1;
+            jobStack.persistences[0] = 0.5f;
+            jobStack.lacunarities[0] = 2f;
+            jobStack.offsets[0] = float3.zero;
+            jobStack.verticalSquashes[0] = 1f;
+            jobStack.densityBiases[0] = 0f;
+            jobStack.powers[0] = 1f;
         }
         
         return jobStack;

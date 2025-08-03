@@ -238,6 +238,9 @@ float sampleLayer(NoiseLayer layer, float3 pos)
         value = sign(value) * pow(abs(value), layer.power);
     }
     
+    // Apply amplitude BEFORE density bias (this is the fix!)
+    value *= layer.amplitude;
+    
     // Apply density bias
     value += layer.densityBias;
     
@@ -249,13 +252,17 @@ float sampleLayer(NoiseLayer layer, float3 pos)
         value *= heightNorm;
     }
     
-    return value * layer.amplitude;
+    return value;
 }
 
 // Evaluate all layers
 float evaluateNoiseStack(float3 worldPos)
 {
     float result = 0.0;
+    
+    // For Add blend mode on first layer, we start from 0
+    // For Override blend mode on first layer, we use the layer value directly
+    bool firstLayer = true;
     
     for (int i = 0; i < LayerCount && i < MAX_LAYERS; i++)
     {
@@ -265,7 +272,12 @@ float evaluateNoiseStack(float3 worldPos)
         float layerValue = sampleLayer(layer, worldPos);
         
         // Apply blend mode
-        if (layer.blendMode == 0) // Add
+        if (firstLayer && layer.blendMode == 0) // First layer with Add mode
+        {
+            result = layerValue; // Just use the value directly
+            firstLayer = false;
+        }
+        else if (layer.blendMode == 0) // Add
             result += layerValue;
         else if (layer.blendMode == 1) // Subtract
             result -= layerValue;
@@ -276,7 +288,10 @@ float evaluateNoiseStack(float3 worldPos)
         else if (layer.blendMode == 4) // Max
             result = max(result, layerValue);
         else if (layer.blendMode == 5) // Override
+        {
             result = layerValue;
+            firstLayer = false;
+        }
     }
     
     return result;

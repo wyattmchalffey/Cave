@@ -1,23 +1,31 @@
 using UnityEngine;
 using UnityEditor;
+using System.Collections.Generic;
 
 [CustomEditor(typeof(WorldManager))]
 public class CaveGenerationEditor : Editor
 {
     private WorldManager worldManager;
-    private bool showChamberSettings = true;
-    private bool showTunnelSettings = true;
-    private bool showGeologicalSettings = true;
-    private bool showOptimizationSettings = true;
     private bool showDebugVisualization = false;
+    private bool showNoiseSection = true;
+    private Vector2 layerScrollPos;
     
     void OnEnable()
     {
         worldManager = (WorldManager)target;
+        
+        // Initialize noise stack if needed
+        if (worldManager.noiseLayerStack == null)
+        {
+            worldManager.noiseLayerStack = new NoiseLayerStack();
+            EditorUtility.SetDirty(worldManager);
+        }
     }
     
     public override void OnInspectorGUI()
     {
+        serializedObject.Update();
+        
         // Custom header
         EditorGUILayout.LabelField("Cave Generation System", EditorStyles.boldLabel);
         EditorGUILayout.Space();
@@ -26,135 +34,175 @@ public class CaveGenerationEditor : Editor
         EditorGUILayout.BeginVertical("box");
         EditorGUILayout.LabelField("Generation Controls", EditorStyles.boldLabel);
         
-        if (GUILayout.Button("Generate Cave Network", GUILayout.Height(30)))
-        {
-            GenerateCaveNetwork();
-        }
-        
         if (Application.isPlaying)
         {
+            if (GUILayout.Button("Force Update All Chunks", GUILayout.Height(30)))
+            {
+                worldManager.ForceUpdateAllChunks();
+            }
+            
+            EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Clear All Chunks"))
             {
                 ClearAllChunks();
             }
             
-            if (GUILayout.Button("Force Update Chunks"))
+            if (GUILayout.Button("Regenerate"))
             {
-                ForceUpdateChunks();
+                ClearAllChunks();
+                worldManager.UpdateChunks();
             }
+            EditorGUILayout.EndHorizontal();
+        }
+        else
+        {
+            EditorGUILayout.HelpBox("Enter Play Mode to use generation controls", MessageType.Info);
         }
         
         EditorGUILayout.EndVertical();
         EditorGUILayout.Space();
         
-        // Cave Settings
+        // Chunk Management section
         EditorGUILayout.BeginVertical("box");
-        showChamberSettings = EditorGUILayout.Foldout(showChamberSettings, "Chamber Settings", true);
-        if (showChamberSettings)
-        {
-            var settings = worldManager.caveSettings;
-            
-            settings.chamberFrequency = EditorGUILayout.Slider(
-                "Chamber Frequency", settings.chamberFrequency, 0.01f, 0.1f);
-            
-            EditorGUILayout.MinMaxSlider("Chamber Radius Range",
-                ref settings.chamberMinRadius, ref settings.chamberMaxRadius, 5f, 50f);
-            EditorGUILayout.LabelField($"Min: {settings.chamberMinRadius:F1}, Max: {settings.chamberMaxRadius:F1}");
-            
-            settings.chamberFloorFlatness = EditorGUILayout.Slider(
-                "Floor Flatness", settings.chamberFloorFlatness, 0f, 1f);
-            
-            settings.chamberVerticalScale = EditorGUILayout.Slider(
-                "Vertical Scale", settings.chamberVerticalScale, 0.1f, 1f);
-            
-            worldManager.caveSettings = settings;
-        }
+        EditorGUILayout.LabelField("Chunk Management", EditorStyles.boldLabel);
+        
+        var chunkPrefab = serializedObject.FindProperty("chunkPrefab");
+        var renderDistance = serializedObject.FindProperty("renderDistance");
+        var chunkSize = serializedObject.FindProperty("chunkSize");
+        var voxelSize = serializedObject.FindProperty("voxelSize");
+        
+        if (chunkPrefab != null) EditorGUILayout.PropertyField(chunkPrefab);
+        if (renderDistance != null) EditorGUILayout.PropertyField(renderDistance);
+        if (chunkSize != null) EditorGUILayout.PropertyField(chunkSize);
+        if (voxelSize != null) EditorGUILayout.PropertyField(voxelSize);
+        
         EditorGUILayout.EndVertical();
         
-        // Tunnel Settings
+        // Optimization section
+        EditorGUILayout.Space();
         EditorGUILayout.BeginVertical("box");
-        showTunnelSettings = EditorGUILayout.Foldout(showTunnelSettings, "Tunnel Settings", true);
-        if (showTunnelSettings)
+        EditorGUILayout.LabelField("Optimization", EditorStyles.boldLabel);
+        
+        var useJobSystem = serializedObject.FindProperty("useJobSystem");
+        var useGPUGeneration = serializedObject.FindProperty("useGPUGeneration");
+        var maxConcurrentJobs = serializedObject.FindProperty("maxConcurrentJobs");
+        
+        if (useJobSystem != null) 
         {
-            var settings = worldManager.caveSettings;
-            
-            EditorGUILayout.MinMaxSlider("Tunnel Radius Range",
-                ref settings.tunnelMinRadius, ref settings.tunnelMaxRadius, 1f, 10f);
-            EditorGUILayout.LabelField($"Min: {settings.tunnelMinRadius:F1}, Max: {settings.tunnelMaxRadius:F1}");
-            
-            settings.tunnelCurvature = EditorGUILayout.Slider(
-                "Tunnel Curvature", settings.tunnelCurvature, 0f, 1f);
-            
-            settings.tunnelFrequency = EditorGUILayout.Slider(
-                "Tunnel Frequency", settings.tunnelFrequency, 0.01f, 0.1f);
-            
-            settings.tunnelConnectionsPerChamber = EditorGUILayout.IntSlider(
-                "Connections Per Chamber", settings.tunnelConnectionsPerChamber, 1, 6);
-            
-            worldManager.caveSettings = settings;
+            EditorGUILayout.PropertyField(useJobSystem);
+            if (useJobSystem.boolValue && maxConcurrentJobs != null)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.PropertyField(maxConcurrentJobs);
+                EditorGUI.indentLevel--;
+            }
         }
+        
+        if (useGPUGeneration != null) EditorGUILayout.PropertyField(useGPUGeneration);
+        
         EditorGUILayout.EndVertical();
         
-        // Geological Settings
+        // Material
+        EditorGUILayout.Space();
         EditorGUILayout.BeginVertical("box");
-        showGeologicalSettings = EditorGUILayout.Foldout(showGeologicalSettings, "Geological Settings", true);
-        if (showGeologicalSettings)
+        EditorGUILayout.LabelField("Rendering", EditorStyles.boldLabel);
+        
+        var caveMaterial = serializedObject.FindProperty("caveMaterial");
+        if (caveMaterial != null) EditorGUILayout.PropertyField(caveMaterial);
+        
+        EditorGUILayout.EndVertical();
+        
+        // Noise Layer Section
+        EditorGUILayout.Space();
+        EditorGUILayout.BeginVertical("box");
+        showNoiseSection = EditorGUILayout.Foldout(showNoiseSection, "Noise Layer System", true);
+        
+        if (showNoiseSection)
         {
-            var settings = worldManager.caveSettings;
+            EditorGUI.indentLevel++;
             
-            settings.stratificationStrength = EditorGUILayout.Slider(
-                "Stratification Strength", settings.stratificationStrength, 0f, 0.5f);
+            // Preset buttons
+            NoiseLayerEditorExtensions.DrawPresetButtons(worldManager);
             
-            settings.stratificationFrequency = EditorGUILayout.Slider(
-                "Stratification Frequency", settings.stratificationFrequency, 0.05f, 0.5f);
+            // Layer controls
+            EditorGUILayout.BeginHorizontal();
             
-            settings.erosionStrength = EditorGUILayout.Slider(
-                "Erosion Strength", settings.erosionStrength, 0f, 1f);
+            if (GUILayout.Button("Add Layer", GUILayout.Width(100)))
+            {
+                AddNewLayer();
+            }
             
-            settings.rockHardness = EditorGUILayout.Slider(
-                "Rock Hardness", settings.rockHardness, 0f, 1f);
+            if (GUILayout.Button("Clear All", GUILayout.Width(100)))
+            {
+                if (EditorUtility.DisplayDialog("Clear All Layers", 
+                    "Are you sure you want to remove all noise layers?", "Yes", "No"))
+                {
+                    worldManager.noiseLayerStack.layers.Clear();
+                    EditorUtility.SetDirty(worldManager);
+                }
+            }
+            
+            if (GUILayout.Button("Reset to Default", GUILayout.Width(120)))
+            {
+                worldManager.noiseLayerStack = new NoiseLayerStack();
+                EditorUtility.SetDirty(worldManager);
+            }
+            
+            EditorGUILayout.EndHorizontal();
             
             EditorGUILayout.Space();
             
-            EditorGUILayout.LabelField("Height Constraints");
-            settings.minCaveHeight = EditorGUILayout.FloatField("Min Cave Height", settings.minCaveHeight);
-            settings.maxCaveHeight = EditorGUILayout.FloatField("Max Cave Height", settings.maxCaveHeight);
-            settings.surfaceTransitionHeight = EditorGUILayout.FloatField(
-                "Surface Transition Height", settings.surfaceTransitionHeight);
-            
-            worldManager.caveSettings = settings;
-        }
-        EditorGUILayout.EndVertical();
-        
-        // Optimization Settings
-        EditorGUILayout.BeginVertical("box");
-        showOptimizationSettings = EditorGUILayout.Foldout(showOptimizationSettings, "Optimization Settings", true);
-        if (showOptimizationSettings)
-        {
-            DrawDefaultInspector();
-        }
-        EditorGUILayout.EndVertical();
-        
-        // Debug Visualization
-        EditorGUILayout.BeginVertical("box");
-        showDebugVisualization = EditorGUILayout.Foldout(showDebugVisualization, "Debug Visualization", true);
-        if (showDebugVisualization && Application.isPlaying)
-        {
-            EditorGUILayout.LabelField($"Active Chunks: {worldManager.totalChunksLoaded}");
-            EditorGUILayout.LabelField($"Total Vertices: {worldManager.totalVertices:N0}");
-            
-            if (worldManager.networkPreprocessor != null && worldManager.networkPreprocessor.chamberCenters.IsCreated)
+            // Layer list
+            if (worldManager.noiseLayerStack != null && worldManager.noiseLayerStack.layers != null)
             {
-                EditorGUILayout.LabelField($"Chambers: {worldManager.networkPreprocessor.chamberCenters.Length}");
-                EditorGUILayout.LabelField($"Tunnels: {worldManager.networkPreprocessor.tunnelNetwork?.Count ?? 0}");
+                if (worldManager.noiseLayerStack.layers.Count > 0)
+                {
+                    EditorGUILayout.LabelField($"Active Layers: {worldManager.noiseLayerStack.layers.Count}");
+                    
+                    layerScrollPos = EditorGUILayout.BeginScrollView(layerScrollPos, GUILayout.MaxHeight(400));
+                    
+                    for (int i = 0; i < worldManager.noiseLayerStack.layers.Count; i++)
+                    {
+                        DrawLayerControls(i);
+                    }
+                    
+                    EditorGUILayout.EndScrollView();
+                }
+                else
+                {
+                    EditorGUILayout.HelpBox("No noise layers. Click 'Add Layer' to create one.", MessageType.Info);
+                }
             }
+            
+            EditorGUI.indentLevel--;
         }
+        
+        EditorGUILayout.EndVertical();
+        EditorGUILayout.Space();
+        
+        // Cave Settings (simplified)
+        EditorGUILayout.BeginVertical("box");
+        EditorGUILayout.LabelField("Height Constraints", EditorStyles.boldLabel);
+        
+        var settings = worldManager.caveSettings;
+        
+        settings.minCaveHeight = EditorGUILayout.FloatField("Min Cave Height", settings.minCaveHeight);
+        settings.maxCaveHeight = EditorGUILayout.FloatField("Max Cave Height", settings.maxCaveHeight);
+        settings.surfaceTransitionHeight = EditorGUILayout.FloatField(
+            new GUIContent("Surface Transition", "Height where caves blend with surface"), 
+            settings.surfaceTransitionHeight);
+        
+        worldManager.caveSettings = settings;
+        
         EditorGUILayout.EndVertical();
         
         // Random seed
         EditorGUILayout.Space();
+        EditorGUILayout.BeginVertical("box");
+        EditorGUILayout.LabelField("Randomization", EditorStyles.boldLabel);
+        
         var seed = worldManager.caveSettings.seed;
-        seed = EditorGUILayout.IntField("Random Seed", seed);
+        seed = EditorGUILayout.IntField("World Seed", seed);
         if (seed != worldManager.caveSettings.seed)
         {
             var s = worldManager.caveSettings;
@@ -162,55 +210,202 @@ public class CaveGenerationEditor : Editor
             worldManager.caveSettings = s;
         }
         
+        if (GUILayout.Button("Randomize Seed"))
+        {
+            var s = worldManager.caveSettings;
+            s.seed = Random.Range(0, int.MaxValue);
+            worldManager.caveSettings = s;
+            
+            if (Application.isPlaying)
+            {
+                ClearAllChunks();
+                worldManager.UpdateChunks();
+            }
+        }
+        
+        EditorGUILayout.EndVertical();
+        
+        // Debug Visualization
+        EditorGUILayout.Space();
+        EditorGUILayout.BeginVertical("box");
+        showDebugVisualization = EditorGUILayout.Foldout(showDebugVisualization, "Debug Info", true);
+        if (showDebugVisualization)
+        {
+            if (Application.isPlaying)
+            {
+                EditorGUILayout.LabelField($"Active Chunks: {worldManager.totalChunksLoaded}");
+                EditorGUILayout.LabelField($"Total Vertices: {worldManager.totalVertices:N0}");
+                
+                if (worldManager.chunks != null)
+                {
+                    EditorGUILayout.LabelField($"Chunk Pool Size: {worldManager.chunks.Count}");
+                }
+            }
+            else
+            {
+                EditorGUILayout.HelpBox("Debug info available in Play Mode", MessageType.Info);
+            }
+            
+            EditorGUILayout.Space();
+            
+            worldManager.showDebugInfo = EditorGUILayout.Toggle("Show Debug Gizmos", worldManager.showDebugInfo);
+        }
+        EditorGUILayout.EndVertical();
+        
+        serializedObject.ApplyModifiedProperties();
+        
+        // Apply changes
         if (GUI.changed)
         {
             EditorUtility.SetDirty(worldManager);
+            
+            // Force chunk updates if in play mode (throttled)
+            if (Application.isPlaying && Time.frameCount % 10 == 0)
+            {
+                worldManager.ForceUpdateAllChunks();
+            }
         }
     }
     
-    void GenerateCaveNetwork()
+    private void DrawLayerControls(int index)
     {
-        if (worldManager.networkPreprocessor == null)
+        var layer = worldManager.noiseLayerStack.layers[index];
+        
+        EditorGUILayout.BeginVertical("box");
+        EditorGUILayout.BeginHorizontal();
+        
+        // Layer name and enabled state
+        layer.enabled = EditorGUILayout.Toggle(layer.enabled, GUILayout.Width(20));
+        layer.layerName = EditorGUILayout.TextField(layer.layerName);
+        
+        // Move buttons
+        GUI.enabled = index > 0;
+        if (GUILayout.Button("↑", GUILayout.Width(25)))
         {
-            worldManager.networkPreprocessor = worldManager.gameObject.AddComponent<CaveNetworkPreprocessor>();
+            worldManager.noiseLayerStack.MoveLayer(index, index - 1);
+        }
+        GUI.enabled = index < worldManager.noiseLayerStack.layers.Count - 1;
+        if (GUILayout.Button("↓", GUILayout.Width(25)))
+        {
+            worldManager.noiseLayerStack.MoveLayer(index, index + 1);
+        }
+        GUI.enabled = true;
+        
+        // Duplicate button
+        if (GUILayout.Button("⧉", GUILayout.Width(25)))
+        {
+            DuplicateLayer(index);
         }
         
-        worldManager.networkPreprocessor.GenerateCaveNetwork(worldManager.caveSettings);
+        // Delete button
+        if (GUILayout.Button("×", GUILayout.Width(25)))
+        {
+            if (EditorUtility.DisplayDialog("Delete Layer", 
+                $"Delete layer '{layer.layerName}'?", "Delete", "Cancel"))
+            {
+                worldManager.noiseLayerStack.RemoveLayer(index);
+                EditorUtility.SetDirty(worldManager);
+            }
+        }
         
-        Debug.Log("Cave network generated successfully!");
+        EditorGUILayout.EndHorizontal();
+        
+        // Draw layer properties (the property drawer will handle this)
+        EditorGUI.BeginChangeCheck();
+        
+        var so = new SerializedObject(worldManager);
+        var layersProp = so.FindProperty("noiseLayerStack").FindPropertyRelative("layers");
+        var layerProp = layersProp.GetArrayElementAtIndex(index);
+        
+        EditorGUILayout.PropertyField(layerProp, GUIContent.none);
+        
+        if (EditorGUI.EndChangeCheck())
+        {
+            so.ApplyModifiedProperties();
+            EditorUtility.SetDirty(worldManager);
+        }
+        
+        EditorGUILayout.EndVertical();
+        EditorGUILayout.Space();
+    }
+    
+    private void AddNewLayer()
+    {
+        var newLayer = new NoiseLayer();
+        
+        // Set unique name
+        int count = 1;
+        string baseName = "New Layer";
+        string newName = baseName;
+        
+        while (LayerNameExists(newName))
+        {
+            newName = $"{baseName} {count++}";
+        }
+        
+        newLayer.layerName = newName;
+        
+        // Set some default values based on existing layers
+        if (worldManager.noiseLayerStack.layers.Count > 0)
+        {
+            var lastLayer = worldManager.noiseLayerStack.layers[worldManager.noiseLayerStack.layers.Count - 1];
+            newLayer.frequency = lastLayer.frequency * 2f; // Higher frequency for detail
+            newLayer.amplitude = lastLayer.amplitude * 0.5f; // Lower amplitude for detail
+        }
+        
+        worldManager.noiseLayerStack.AddLayer(newLayer);
+        EditorUtility.SetDirty(worldManager);
+    }
+    
+    private void DuplicateLayer(int index)
+    {
+        var original = worldManager.noiseLayerStack.layers[index];
+        var duplicate = new NoiseLayer
+        {
+            layerName = original.layerName + " (Copy)",
+            enabled = original.enabled,
+            noiseType = original.noiseType,
+            blendMode = original.blendMode,
+            frequency = original.frequency,
+            amplitude = original.amplitude,
+            octaves = original.octaves,
+            persistence = original.persistence,
+            lacunarity = original.lacunarity,
+            offset = original.offset,
+            verticalSquash = original.verticalSquash,
+            densityBias = original.densityBias,
+            power = original.power,
+            useHeightConstraints = original.useHeightConstraints,
+            minHeight = original.minHeight,
+            maxHeight = original.maxHeight,
+            heightFalloff = new AnimationCurve(original.heightFalloff.keys),
+            showPreview = original.showPreview,
+            previewGradient = new Gradient()
+        };
+        
+        // Copy gradient
+        duplicate.previewGradient.SetKeys(original.previewGradient.colorKeys, original.previewGradient.alphaKeys);
+        
+        worldManager.noiseLayerStack.layers.Insert(index + 1, duplicate);
+        EditorUtility.SetDirty(worldManager);
+    }
+    
+    private bool LayerNameExists(string name)
+    {
+        foreach (var layer in worldManager.noiseLayerStack.layers)
+        {
+            if (layer.layerName == name) return true;
+        }
+        return false;
     }
     
     void ClearAllChunks()
     {
-        // This would clear all active chunks
-        Debug.Log("Clearing all chunks...");
-    }
-    
-    void ForceUpdateChunks()
-    {
-        // This would force chunk updates
-        Debug.Log("Forcing chunk update...");
-    }
-}
-
-// Property drawer for CaveSettings
-[CustomPropertyDrawer(typeof(CaveSettings))]
-public class CaveSettingsDrawer : PropertyDrawer
-{
-    public override void OnGUI(Rect position, SerializedProperty property, GUIContent label)
-    {
-        EditorGUI.BeginProperty(position, label, property);
-        
-        // Draw label
-        position = EditorGUI.PrefixLabel(position, GUIUtility.GetControlID(FocusType.Passive), label);
-        
-        // Don't indent child fields
-        var indent = EditorGUI.indentLevel;
-        EditorGUI.indentLevel = 0;
-        
-        // Draw fields - you can add custom layout here
-        
-        EditorGUI.indentLevel = indent;
-        EditorGUI.EndProperty();
+        var allChunks = new List<Vector3Int>(worldManager.chunks.Keys);
+        foreach (var coord in allChunks)
+        {
+            worldManager.RemoveChunk(coord);
+        }
+        worldManager.chunkGenerationQueue.Clear();
     }
 }

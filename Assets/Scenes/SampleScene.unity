@@ -451,9 +451,8 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1274155588}
-  - component: {fileID: 1274155587}
-  - component: {fileID: 1274155586}
   - component: {fileID: 1274155585}
+  - component: {fileID: 1274155587}
   m_Layer: 0
   m_Name: World
   m_TagString: Untagged
@@ -478,48 +477,32 @@ MonoBehaviour:
   chunkSize: 32
   voxelSize: 0.25
   caveSettings:
-    chamberFrequency: 0.02
-    chamberMinRadius: 8
-    chamberMaxRadius: 20
-    chamberFloorFlatness: 0.7
-    chamberVerticalScale: 0.6
-    tunnelMinRadius: 2
-    tunnelMaxRadius: 4
-    tunnelCurvature: 0.3
-    tunnelFrequency: 0.05
-    tunnelConnectionsPerChamber: 3
-    stratificationStrength: 0.15
-    stratificationFrequency: 0.1
-    erosionStrength: 0.3
-    rockHardness: 0.5
-    seed: 42
+    minCaveHeight: -50
+    maxCaveHeight: 50
+    surfaceTransitionHeight: 40
+    seed: 478674637
     noiseOffset:
       x: 0
       y: 0
       z: 0
-    worleyOctaves: 2
-    worleyPersistence: 0.5
-    minCaveHeight: -50
-    maxCaveHeight: 50
-    surfaceTransitionHeight: 40
   noiseLayerStack:
     layers:
     - layerName: Main Caverns
       enabled: 1
-      noiseType: 0
-      blendMode: 0
-      frequency: 0.034
-      amplitude: 1.98
-      octaves: 3
+      noiseType: 2
+      blendMode: 1
+      frequency: 0.04
+      amplitude: 1.37
+      octaves: 2
       persistence: 0.5
-      lacunarity: 2
+      lacunarity: 2.67
       offset:
         x: 0
         y: 0
         z: 0
-      verticalSquash: 0.3
-      densityBias: 0
-      power: 1
+      verticalSquash: 0.2
+      densityBias: -0.56
+      power: 2.5
       useHeightConstraints: 0
       minHeight: -50
       maxHeight: 50
@@ -581,29 +564,9 @@ MonoBehaviour:
   useJobSystem: 1
   useGPUGeneration: 0
   maxConcurrentJobs: 4
-  showDebugInfo: 0
+  showDebugInfo: 1
   totalChunksLoaded: 0
   totalVertices: 0
-  networkPreprocessor: {fileID: 0}
---- !u!114 &1274155586
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1274155584}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ca30560faae917d4a86c765a25ff10ea, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  worldSeed: 42
-  worldSize:
-    x: 1000
-    y: 100
-    z: 1000
-  chamberCount: 50
-  maxTunnelsPerChamber: 4
 --- !u!114 &1274155587
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -619,30 +582,14 @@ MonoBehaviour:
   noiseGenerationShader: {fileID: 7200000, guid: b53b12945f0f91744818c70db74ca802, type: 3}
   meshGenerationShader: {fileID: 7200000, guid: d39ff92d9d4c5704eab1b0eae26b06a9, type: 3}
   caveSettings:
-    chamberFrequency: 0.02
-    chamberMinRadius: 8
-    chamberMaxRadius: 20
-    chamberFloorFlatness: 0.7
-    chamberVerticalScale: 0.6
-    tunnelMinRadius: 2
-    tunnelMaxRadius: 4
-    tunnelCurvature: 0.3
-    tunnelFrequency: 0.05
-    tunnelConnectionsPerChamber: 3
-    stratificationStrength: 0.15
-    stratificationFrequency: 0.1
-    erosionStrength: 0.3
-    rockHardness: 0.5
+    minCaveHeight: -50
+    maxCaveHeight: 50
+    surfaceTransitionHeight: 40
     seed: 42
     noiseOffset:
       x: 0
       y: 0
       z: 0
-    worleyOctaves: 2
-    worleyPersistence: 0.5
-    minCaveHeight: -50
-    maxCaveHeight: 50
-    surfaceTransitionHeight: 40
   caveMaterial: {fileID: 2100000, guid: 97ebab7fd75682045b62c72a2e1ba00f, type: 2}
   showNoisePreview: 0
 --- !u!4 &1274155588
@@ -654,7 +601,7 @@ Transform:
   m_GameObject: {fileID: 1274155584}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -96.41006, y: 0, z: 21.11686}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []

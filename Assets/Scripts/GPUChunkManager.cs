@@ -216,10 +216,7 @@ public class GPUChunkManager : MonoBehaviour
         }
         
         noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "ChamberCenters", chamberBuffer);
-        noiseGenerationShader.SetInt("ChamberCount", 
-            (worldManager.networkPreprocessor != null && 
-             worldManager.networkPreprocessor.chamberCenters.IsCreated) ? 
-             worldManager.networkPreprocessor.chamberCenters.Length : 0);
+        noiseGenerationShader.SetInt("ChamberCount", 0);
         
         // Dispatch noise generation
         int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8f);
@@ -297,68 +294,75 @@ public class GPUChunkManager : MonoBehaviour
         var layers = worldManager.noiseLayerStack.layers;
         int layerCount = Mathf.Min(layers.Count, 16); // Max 16 layers
         
+        // Always create at least one element to avoid GPU errors
+        int bufferSize = Mathf.Max(1, layerCount);
+        
         // Create or resize buffer if needed
-        if (noiseLayerBuffer == null || noiseLayerBuffer.count != layerCount)
+        if (noiseLayerBuffer == null || noiseLayerBuffer.count != bufferSize)
         {
             noiseLayerBuffer?.Release();
-            if (layerCount > 0)
-            {
-                noiseLayerBuffer = new ComputeBuffer(layerCount, System.Runtime.InteropServices.Marshal.SizeOf<GPUNoiseLayer>());
-            }
+            noiseLayerBuffer = new ComputeBuffer(bufferSize, System.Runtime.InteropServices.Marshal.SizeOf<GPUNoiseLayer>());
         }
         
-        if (layerCount > 0)
+        // Convert layers to GPU format
+        GPUNoiseLayer[] gpuLayers = new GPUNoiseLayer[bufferSize];
+        
+        for (int i = 0; i < layerCount; i++)
         {
-            // Convert layers to GPU format
-            GPUNoiseLayer[] gpuLayers = new GPUNoiseLayer[layerCount];
-            for (int i = 0; i < layerCount; i++)
+            var layer = layers[i];
+            gpuLayers[i] = new GPUNoiseLayer
             {
-                var layer = layers[i];
-                gpuLayers[i] = new GPUNoiseLayer
-                {
-                    enabled = layer.enabled ? 1 : 0,
-                    noiseType = (int)layer.noiseType,
-                    blendMode = (int)layer.blendMode,
-                    frequency = layer.frequency,
-                    amplitude = layer.amplitude,
-                    octaves = layer.octaves,
-                    persistence = layer.persistence,
-                    lacunarity = layer.lacunarity,
-                    offset = layer.offset,
-                    verticalSquash = layer.verticalSquash,
-                    densityBias = layer.densityBias,
-                    power = layer.power,
-                    minHeight = layer.minHeight,
-                    maxHeight = layer.maxHeight,
-                    useHeightConstraints = layer.useHeightConstraints ? 1 : 0
-                };
-            }
-            
-            noiseLayerBuffer.SetData(gpuLayers);
+                enabled = layer.enabled ? 1 : 0,
+                noiseType = (int)layer.noiseType,
+                blendMode = (int)layer.blendMode,
+                frequency = layer.frequency,
+                amplitude = layer.amplitude,
+                octaves = layer.octaves,
+                persistence = layer.persistence,
+                lacunarity = layer.lacunarity,
+                offset = layer.offset,
+                verticalSquash = layer.verticalSquash,
+                densityBias = layer.densityBias,
+                power = layer.power,
+                minHeight = layer.minHeight,
+                maxHeight = layer.maxHeight,
+                useHeightConstraints = layer.useHeightConstraints ? 1 : 0
+            };
         }
+        
+        // If no layers, create a dummy disabled layer
+        if (layerCount == 0)
+        {
+            gpuLayers[0] = new GPUNoiseLayer
+            {
+                enabled = 0,
+                noiseType = 0,
+                blendMode = 0,
+                frequency = 0.02f,
+                amplitude = 0f,
+                octaves = 1,
+                persistence = 0.5f,
+                lacunarity = 2f,
+                offset = Vector3.zero,
+                verticalSquash = 1f,
+                densityBias = 0f,
+                power = 1f,
+                minHeight = -50f,
+                maxHeight = 50f,
+                useHeightConstraints = 0
+            };
+        }
+        
+        noiseLayerBuffer.SetData(gpuLayers);
     }
     
     void UpdateChamberBuffer()
     {
-        if (worldManager.networkPreprocessor != null && 
-            worldManager.networkPreprocessor.chamberCenters.IsCreated &&
-            worldManager.networkPreprocessor.chamberCenters.Length > 0)
+        // Always use a dummy chamber buffer since we're not using the preprocessor
+        if (chamberBuffer == null || !chamberBuffer.IsValid())
         {
-            int chamberCount = worldManager.networkPreprocessor.chamberCenters.Length;
-            
-            if (chamberBuffer == null || chamberBuffer.count != chamberCount)
-            {
-                chamberBuffer?.Release();
-                chamberBuffer = new ComputeBuffer(chamberCount, sizeof(float) * 3);
-            }
-            
-            // Copy chamber data
-            Vector3[] chambers = new Vector3[chamberCount];
-            for (int i = 0; i < chamberCount; i++)
-            {
-                chambers[i] = worldManager.networkPreprocessor.chamberCenters[i];
-            }
-            chamberBuffer.SetData(chambers);
+            chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
+            chamberBuffer.SetData(new Vector3[] { Vector3.zero });
         }
     }
     

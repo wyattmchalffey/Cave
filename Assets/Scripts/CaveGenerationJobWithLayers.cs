@@ -48,7 +48,6 @@ public struct CaveGenerationJobWithLayers : IJob
     [ReadOnly] public int chunkSize;
     [ReadOnly] public float voxelSize;
     [ReadOnly] public CaveSettings settings;
-    [ReadOnly] public NativeArray<float3> chamberCenters;
     [ReadOnly] public JobNoiseLayerStack noiseLayerStack;
     
     // Output
@@ -269,29 +268,8 @@ public struct CaveGenerationJobWithLayers : IJob
         cavern = math.pow(cavern, 2f);
         cavern += perlin * 0.1f;
         
-        // If we have chamber centers, carve out chambers
-        if (chamberCenters.IsCreated && chamberCenters.Length > 0)
-        {
-            float minChamberDist = float.MaxValue;
-            
-            for (int i = 0; i < chamberCenters.Length; i++)
-            {
-                float3 chamberPos = chamberCenters[i];
-                float3 diff = pos - chamberPos;
-                diff.y *= 2f; // Vertically squash chambers
-                float dist = math.length(diff);
-                minChamberDist = math.min(minChamberDist, dist);
-            }
-            
-            // Carve out chamber
-            float chamberRadius = settings.chamberMaxRadius;
-            float chamberInfluence = math.saturate(1f - minChamberDist / chamberRadius);
-            chamberInfluence = math.smoothstep(0f, 1f, chamberInfluence);
-            
-            cavern = math.min(cavern, 1f - chamberInfluence);
-        }
-        
-        return cavern * 2f - 1f; // Remap to -1 to 1
+        // Remap to -1 to 1
+        return cavern * 2f - 1f;
     }
     
     float3 HashToFloat3(float3 p)
