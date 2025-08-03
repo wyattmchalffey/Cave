@@ -20,7 +20,6 @@ public class WorldManager : MonoBehaviour
     
     [Header("Optimization")]
     public bool useJobSystem = true;
-    public bool useGPUGeneration = false;
     public int maxConcurrentJobs = 4;
     
     [Header("Debug")]
@@ -47,15 +46,6 @@ public class WorldManager : MonoBehaviour
         if (player == null)
         {
             Debug.LogWarning("No player found! Tag your player GameObject with 'Player'");
-        }
-        
-        if (useGPUGeneration)
-        {
-            gpuChunkManager = GetComponent<GPUChunkManager>();
-            if (gpuChunkManager == null)
-            {
-                gpuChunkManager = gameObject.AddComponent<GPUChunkManager>();
-            }
         }
         
         // Generate initial chunks
@@ -124,24 +114,20 @@ public class WorldManager : MonoBehaviour
             RemoveChunk(coord);
         }
     }
-    
+
     void ProcessGenerationQueue()
     {
         // Clean up completed jobs
         activeJobs.RemoveAll(handle => handle.IsCompleted);
-        
+
         // Start new jobs
         while (chunkGenerationQueue.Count > 0 && activeJobs.Count < maxConcurrentJobs)
         {
             Vector3Int chunkCoord = chunkGenerationQueue.Dequeue();
-            
-            if (useJobSystem && !useGPUGeneration)
+
+            if (useJobSystem) // Removed GPU check - GPU is handled by ChunkGPUIntegration
             {
                 StartChunkGenerationJob(chunkCoord);
-            }
-            else if (useGPUGeneration && gpuChunkManager != null)
-            {
-                GenerateChunkGPU(chunkCoord);
             }
             else
             {
@@ -149,7 +135,7 @@ public class WorldManager : MonoBehaviour
             }
         }
     }
-    
+
     void StartChunkGenerationJob(Vector3Int chunkCoord)
     {
         // Create chunk GameObject

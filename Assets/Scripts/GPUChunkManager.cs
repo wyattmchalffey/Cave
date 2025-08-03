@@ -1,3 +1,4 @@
+// GPUChunkManager.cs - Complete Implementation with Async Optimization
 using System.Collections;
 using System.Collections.Generic;
 using Unity.Collections;
@@ -41,13 +42,9 @@ public class GPUChunkManager : MonoBehaviour
     private ComputeBuffer densityBuffer;
     private ComputeBuffer chamberBuffer;
     private ComputeBuffer vertexBuffer;
+    private ComputeBuffer normalBuffer;
     private ComputeBuffer triangleBuffer;
     private ComputeBuffer counterBuffer;
-    
-    // Additional buffers for marching cubes
-    private ComputeBuffer voxelOccupiedBuffer;
-    private ComputeBuffer voxelVertexCountBuffer;
-    private ComputeBuffer voxelVertexOffsetBuffer;
     
     // Marching cubes tables
     private ComputeBuffer edgeTableBuffer;
@@ -60,10 +57,14 @@ public class GPUChunkManager : MonoBehaviour
     private const int CHUNK_SIZE = 32;
     private const float VOXEL_SIZE = 0.25f;
     private const int MAX_VERTICES = 65536;
-    private const int MAX_TRIANGLES = MAX_VERTICES * 3;
+    private const int MAX_TRIANGLES = MAX_VERTICES / 3;
     
     private bool isInitialized = false;
     private WorldManager worldManager;
+    
+    // Queue for chunk requests
+    private Queue<GPUChunkRequest> requestQueue = new Queue<GPUChunkRequest>();
+    private bool isProcessing = false;
     
     // Struct matching the compute shader
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -120,7 +121,7 @@ public class GPUChunkManager : MonoBehaviour
         
         if (generateNoiseFieldKernel < 0 || marchingCubesKernel < 0)
         {
-            Debug.LogError("Failed to find compute shader kernels!");
+            Debug.LogError("Failed to find required compute shader kernels!");
             return false;
         }
         
@@ -130,38 +131,43 @@ public class GPUChunkManager : MonoBehaviour
     void InitializeBuffers()
     {
         int densitySize = (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1) * (CHUNK_SIZE + 1);
-        int voxelCount = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
         
         // Density field buffer
         densityBuffer = new ComputeBuffer(densitySize, sizeof(float));
         
-        // Vertex and triangle buffers
-        vertexBuffer = new ComputeBuffer(MAX_VERTICES, sizeof(float) * 3);
-        triangleBuffer = new ComputeBuffer(MAX_TRIANGLES, sizeof(int));
+        // Vertex and triangle buffers with counter
+        vertexBuffer = new ComputeBuffer(MAX_VERTICES, sizeof(float) * 3, ComputeBufferType.Append);
+        normalBuffer = new ComputeBuffer(MAX_VERTICES, sizeof(float) * 3, ComputeBufferType.Append);
+        triangleBuffer = new ComputeBuffer(MAX_TRIANGLES * 3, sizeof(int), ComputeBufferType.Append);
         
-        // Counter buffers
-        counterBuffer = new ComputeBuffer(2, sizeof(int), ComputeBufferType.Counter);
-        
-        // Voxel processing buffers
-        voxelOccupiedBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
-        voxelVertexCountBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
-        voxelVertexOffsetBuffer = new ComputeBuffer(voxelCount, sizeof(uint));
+        // Counter buffer to track vertex/triangle count
+        counterBuffer = new ComputeBuffer(1, sizeof(int), ComputeBufferType.IndirectArguments);
         
         // Initialize marching cubes tables
         InitializeMarchingCubesTables();
         
-        // Initialize chamber buffer with at least one element (even if empty)
-        if (chamberBuffer == null)
-        {
-            chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
-            chamberBuffer.SetData(new Vector3[] { Vector3.zero });
-        }
+        // Initialize chamber buffer with at least one element
+        chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
+        chamberBuffer.SetData(new Vector3[] { Vector3.zero });
         
         // Noise preview texture
         if (showNoisePreview)
         {
             CreatePreviewTexture();
         }
+    }
+    
+    void InitializeMarchingCubesTables()
+    {
+        // Edge table - which edges are intersected for each cube configuration
+        int[] edgeTable = MarchingCubesTables.EdgeTable;
+        edgeTableBuffer = new ComputeBuffer(256, sizeof(int));
+        edgeTableBuffer.SetData(edgeTable);
+        
+        // Triangle table - how to connect the edges to form triangles
+        int[] triTable = MarchingCubesTables.TriTable;
+        triTableBuffer = new ComputeBuffer(256 * 16, sizeof(int));
+        triTableBuffer.SetData(triTable);
     }
     
     void CreatePreviewTexture()
@@ -178,7 +184,62 @@ public class GPUChunkManager : MonoBehaviour
     
     public void RequestChunk(GPUChunkRequest request)
     {
-        StartCoroutine(GenerateChunkAsync(request));
+        requestQueue.Enqueue(request);
+        
+        if (!isProcessing)
+        {
+            StartCoroutine(ProcessRequestQueue());
+        }
+    }
+    
+    public void RequestChunkBatch(List<GPUChunkRequest> requests)
+    {
+        StartCoroutine(ProcessBatchAsync(requests));
+    }
+    
+    IEnumerator ProcessRequestQueue()
+    {
+        isProcessing = true;
+        
+        while (requestQueue.Count > 0)
+        {
+            var request = requestQueue.Dequeue();
+            yield return StartCoroutine(GenerateChunkAsync(request));
+        }
+        
+        isProcessing = false;
+    }
+    
+    void GenerateChunkOnGPU(Vector3 chunkOrigin, int lodLevel)
+    {
+        // Dispatch noise generation
+        noiseGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
+        noiseGenerationShader.SetInt("LayerCount", worldManager.noiseLayerStack.layers.Count);
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "Layers", noiseLayerBuffer);
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "DensityField", densityBuffer);
+        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "ChamberCenters", chamberBuffer);
+        noiseGenerationShader.SetInt("ChamberCount", 0);
+        
+        int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8f);
+        noiseGenerationShader.Dispatch(generateNoiseFieldKernel, threadGroups, threadGroups, threadGroups);
+        
+        // Reset buffers
+        vertexBuffer.SetCounterValue(0);
+        normalBuffer.SetCounterValue(0);
+        triangleBuffer.SetCounterValue(0);
+        
+        // Dispatch mesh generation
+        meshGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
+        meshGenerationShader.SetInt("LODLevel", lodLevel);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "DensityField", densityBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "Vertices", vertexBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "Normals", normalBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "Triangles", triangleBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "EdgeTable", edgeTableBuffer);
+        meshGenerationShader.SetBuffer(marchingCubesKernel, "TriTable", triTableBuffer);
+        
+        threadGroups = Mathf.CeilToInt(CHUNK_SIZE / 8f);
+        meshGenerationShader.Dispatch(marchingCubesKernel, threadGroups, threadGroups, threadGroups);
     }
     
     IEnumerator GenerateChunkAsync(GPUChunkRequest request)
@@ -189,89 +250,118 @@ public class GPUChunkManager : MonoBehaviour
             yield break;
         }
         
-        // Update noise layer buffer
+        // Update buffers
         UpdateNoiseLayerBuffer();
-        
-        // Update chamber buffer if available
         UpdateChamberBuffer();
         
-        // Generate density field
+        // Calculate chunk origin
         Vector3 chunkOrigin = new Vector3(
             request.coordinate.x * CHUNK_SIZE * VOXEL_SIZE,
             request.coordinate.y * CHUNK_SIZE * VOXEL_SIZE,
             request.coordinate.z * CHUNK_SIZE * VOXEL_SIZE
         );
         
-        // Set noise generation parameters
-        noiseGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
-        noiseGenerationShader.SetInt("LayerCount", worldManager.noiseLayerStack.layers.Count);
-        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "Layers", noiseLayerBuffer);
-        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "DensityField", densityBuffer);
+        // Generate on GPU
+        GenerateChunkOnGPU(chunkOrigin, request.lodLevel);
         
-        // Always set chamber buffer
-        if (chamberBuffer == null)
+        // Use async readback for vertex count
+        bool countReceived = false;
+        int vertexCount = 0;
+        
+        AsyncGPUReadback.Request(counterBuffer, (countRequest) =>
         {
-            chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
-            chamberBuffer.SetData(new Vector3[] { Vector3.zero });
+            if (countRequest.hasError)
+            {
+                Debug.LogError("GPU readback error!");
+                countReceived = true;
+                return;
+            }
+            
+            var data = countRequest.GetData<int>();
+            vertexCount = data[0];
+            
+            // Fix for the vertex count bug
+            if (vertexCount > MAX_VERTICES)
+            {
+                Debug.LogWarning($"Vertex count {vertexCount} exceeds max, clamping to {MAX_VERTICES}");
+                vertexCount = Mathf.Min(vertexCount, MAX_VERTICES);
+            }
+            
+            countReceived = true;
+        });
+        
+        // Wait for count
+        while (!countReceived)
+        {
+            yield return null;
         }
         
-        noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "ChamberCenters", chamberBuffer);
-        noiseGenerationShader.SetInt("ChamberCount", 0);
-        
-        // Dispatch noise generation
-        int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8f);
-        noiseGenerationShader.Dispatch(generateNoiseFieldKernel, threadGroups, threadGroups, threadGroups);
-        
-        yield return null; // Wait a frame
-        
-        // Reset counters
-        counterBuffer.SetCounterValue(0);
-        
-        // Set mesh generation parameters
-        meshGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
-        meshGenerationShader.SetInt("LODLevel", request.lodLevel);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "DensityField", densityBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "Vertices", vertexBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "Triangles", triangleBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "VertexCount", counterBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "TriangleCount", counterBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "EdgeTable", edgeTableBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "TriTable", triTableBuffer);
-        
-        // Set the voxel processing buffers
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelOccupied", voxelOccupiedBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelVertexCount", voxelVertexCountBuffer);
-        meshGenerationShader.SetBuffer(marchingCubesKernel, "VoxelVertexOffset", voxelVertexOffsetBuffer);
-        
-        // Dispatch mesh generation
-        meshGenerationShader.Dispatch(marchingCubesKernel, threadGroups, threadGroups, threadGroups);
-        
-        yield return null; // Wait a frame
-        
-        // Read back results
-        int[] counts = new int[2];
-        counterBuffer.GetData(counts);
-        int vertexCount = counts[0];
-        int triangleCount = vertexCount; // Assuming triangle count equals vertex count
-        
-        if (vertexCount > 0 && vertexCount < MAX_VERTICES)
+        if (vertexCount > 0 && vertexCount <= MAX_VERTICES)
         {
-            // Read vertex data
-            Vector3[] vertices = new Vector3[vertexCount];
-            vertexBuffer.GetData(vertices, 0, 0, vertexCount);
+            // Now do async readback for actual vertex data
+            bool dataReceived = false;
+            ChunkMeshData meshData = new ChunkMeshData();
             
-            // Read triangle data
-            int[] triangles = new int[triangleCount];
-            triangleBuffer.GetData(triangles, 0, 0, triangleCount);
-            
-            // Create mesh data
-            ChunkMeshData meshData = new ChunkMeshData
+            // Request vertices
+            AsyncGPUReadback.Request(vertexBuffer, vertexCount * 12, 0, (vertRequest) =>
             {
-                vertices = vertices,
-                triangles = triangles,
-                normals = CalculateNormals(vertices, triangles),
-                uvs = CalculateUVs(vertices)
-            };
+                if (vertRequest.hasError)
+                {
+                    dataReceived = true;
+                    return;
+                }
+                
+                var vertices = new Vector3[vertexCount];
+                var vertexData = vertRequest.GetData<Vector3>();
+                for (int i = 0; i < vertexCount; i++)
+                {
+                    vertices[i] = vertexData[i];
+                }
+                
+                // Request normals
+                AsyncGPUReadback.Request(normalBuffer, vertexCount * 12, 0, (normRequest) =>
+                {
+                    if (normRequest.hasError)
+                    {
+                        dataReceived = true;
+                        return;
+                    }
+                    
+                    var normals = new Vector3[vertexCount];
+                    var normalData = normRequest.GetData<Vector3>();
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        normals[i] = normalData[i];
+                    }
+                    
+                    // Generate triangle indices
+                    int[] triangles = new int[vertexCount];
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        triangles[i] = i;
+                    }
+                    
+                    // Generate UVs
+                    Vector2[] uvs = CalculateUVs(vertices);
+                    
+                    // Create mesh data
+                    meshData = new ChunkMeshData
+                    {
+                        vertices = vertices,
+                        triangles = triangles,
+                        normals = normals,
+                        uvs = uvs
+                    };
+                    
+                    dataReceived = true;
+                });
+            });
+            
+            // Wait for all data
+            while (!dataReceived)
+            {
+                yield return null;
+            }
             
             // Invoke callback
             request.onComplete?.Invoke(meshData);
@@ -289,12 +379,115 @@ public class GPUChunkManager : MonoBehaviour
         }
     }
     
+    IEnumerator ProcessBatchAsync(List<GPUChunkRequest> requests)
+    {
+        // Generate all chunks on GPU first
+        foreach (var request in requests)
+        {
+            UpdateNoiseLayerBuffer();
+            UpdateChamberBuffer();
+            
+            Vector3 chunkOrigin = new Vector3(
+                request.coordinate.x * CHUNK_SIZE * VOXEL_SIZE,
+                request.coordinate.y * CHUNK_SIZE * VOXEL_SIZE,
+                request.coordinate.z * CHUNK_SIZE * VOXEL_SIZE
+            );
+            
+            GenerateChunkOnGPU(chunkOrigin, request.lodLevel);
+        }
+        
+        // Then read them all back asynchronously
+        int completed = 0;
+        
+        foreach (var request in requests)
+        {
+            AsyncGPUReadback.Request(counterBuffer, (countRequest) =>
+            {
+                // Process each chunk asynchronously
+                StartCoroutine(ProcessSingleChunkReadback(countRequest, request, () => completed++));
+            });
+        }
+        
+        // Wait for all to complete
+        while (completed < requests.Count)
+        {
+            yield return null;
+        }
+    }
+    
+    IEnumerator ProcessSingleChunkReadback(AsyncGPUReadbackRequest countRequest, GPUChunkRequest request, System.Action onComplete)
+    {
+        if (countRequest.hasError)
+        {
+            onComplete?.Invoke();
+            yield break;
+        }
+        
+        var data = countRequest.GetData<int>();
+        int vertexCount = Mathf.Min(data[0], MAX_VERTICES);
+        
+        if (vertexCount > 0)
+        {
+            // Async readback vertices and normals
+            bool done = false;
+            
+            AsyncGPUReadback.Request(vertexBuffer, vertexCount * 12, 0, (vertRequest) =>
+            {
+                if (!vertRequest.hasError)
+                {
+                    var vertices = new Vector3[vertexCount];
+                    vertRequest.GetData<Vector3>().CopyTo(vertices);
+                    
+                    AsyncGPUReadback.Request(normalBuffer, vertexCount * 12, 0, (normRequest) =>
+                    {
+                        if (!normRequest.hasError)
+                        {
+                            var normals = new Vector3[vertexCount];
+                            normRequest.GetData<Vector3>().CopyTo(normals);
+                            
+                            // Create mesh data
+                            var meshData = new ChunkMeshData
+                            {
+                                vertices = vertices,
+                                triangles = GenerateSequentialIndices(vertexCount),
+                                normals = normals,
+                                uvs = CalculateUVs(vertices)
+                            };
+                            
+                            request.onComplete?.Invoke(meshData);
+                        }
+                        done = true;
+                        onComplete?.Invoke();
+                    });
+                }
+                else
+                {
+                    done = true;
+                    onComplete?.Invoke();
+                }
+            });
+            
+            while (!done) yield return null;
+        }
+        else
+        {
+            request.onComplete?.Invoke(new ChunkMeshData
+            {
+                vertices = new Vector3[0],
+                triangles = new int[0],
+                normals = new Vector3[0],
+                uvs = new Vector2[0]
+            });
+            onComplete?.Invoke();
+        }
+    }
+    
     void UpdateNoiseLayerBuffer()
     {
         var layers = worldManager.noiseLayerStack.layers;
         int layerCount = Mathf.Min(layers.Count, 16); // Max 16 layers
         
-        // Always create at least one element to avoid GPU errors
+        // Always create at least one element
         int bufferSize = Mathf.Max(1, layerCount);
         
         // Create or resize buffer if needed
@@ -326,31 +519,15 @@ public class GPUChunkManager : MonoBehaviour
                 power = layer.power,
                 minHeight = layer.minHeight,
                 maxHeight = layer.maxHeight,
-                useHeightConstraints = layer.useHeightConstraints ? 1 : 0
+                useHeightConstraints = layer.useHeightConstraints ? 1 : 0,
+                _padding = 0
             };
         }
         
-        // If no layers, create a dummy disabled layer
-        if (layerCount == 0)
+        // Fill remaining slots with disabled layers if needed
+        for (int i = layerCount; i < bufferSize; i++)
         {
-            gpuLayers[0] = new GPUNoiseLayer
-            {
-                enabled = 0,
-                noiseType = 0,
-                blendMode = 0,
-                frequency = 0.02f,
-                amplitude = 0f,
-                octaves = 1,
-                persistence = 0.5f,
-                lacunarity = 2f,
-                offset = Vector3.zero,
-                verticalSquash = 1f,
-                densityBias = 0f,
-                power = 1f,
-                minHeight = -50f,
-                maxHeight = 50f,
-                useHeightConstraints = 0
-            };
+            gpuLayers[i] = new GPUNoiseLayer { enabled = 0 };
         }
         
         noiseLayerBuffer.SetData(gpuLayers);
@@ -358,61 +535,13 @@ public class GPUChunkManager : MonoBehaviour
     
     void UpdateChamberBuffer()
     {
-        // Always use a dummy chamber buffer since we're not using the preprocessor
+        // TODO: Implement chamber system
+        // For now, just ensure buffer exists
         if (chamberBuffer == null || !chamberBuffer.IsValid())
         {
             chamberBuffer = new ComputeBuffer(1, sizeof(float) * 3);
             chamberBuffer.SetData(new Vector3[] { Vector3.zero });
         }
-    }
-    
-    public void GenerateNoisePreview(int layerIndex = -1)
-    {
-        if (!isInitialized || noisePreviewTexture == null) return;
-        
-        UpdateNoiseLayerBuffer();
-        
-        // Set preview parameters
-        noiseGenerationShader.SetInt("LayerCount", 
-            layerIndex >= 0 ? layerIndex + 1 : worldManager.noiseLayerStack.layers.Count);
-        noiseGenerationShader.SetBuffer(generateNoisePreviewKernel, "Layers", noiseLayerBuffer);
-        noiseGenerationShader.SetTexture(generateNoisePreviewKernel, "PreviewTexture", noisePreviewTexture);
-        
-        // Dispatch preview generation
-        int threadGroupsX = Mathf.CeilToInt(noisePreviewTexture.width / 8f);
-        int threadGroupsY = Mathf.CeilToInt(noisePreviewTexture.height / 8f);
-        noiseGenerationShader.Dispatch(generateNoisePreviewKernel, threadGroupsX, threadGroupsY, 1);
-    }
-    
-    Vector3[] CalculateNormals(Vector3[] vertices, int[] triangles)
-    {
-        Vector3[] normals = new Vector3[vertices.Length];
-        
-        // Calculate face normals and accumulate
-        for (int i = 0; i < triangles.Length; i += 3)
-        {
-            int i0 = triangles[i];
-            int i1 = triangles[i + 1];
-            int i2 = triangles[i + 2];
-            
-            Vector3 v0 = vertices[i0];
-            Vector3 v1 = vertices[i1];
-            Vector3 v2 = vertices[i2];
-            
-            Vector3 faceNormal = Vector3.Cross(v1 - v0, v2 - v0).normalized;
-            
-            normals[i0] += faceNormal;
-            normals[i1] += faceNormal;
-            normals[i2] += faceNormal;
-        }
-        
-        // Normalize
-        for (int i = 0; i < normals.Length; i++)
-        {
-            normals[i] = normals[i].normalized;
-        }
-        
-        return normals;
     }
     
     Vector2[] CalculateUVs(Vector3[] vertices)
@@ -421,69 +550,56 @@ public class GPUChunkManager : MonoBehaviour
         
         for (int i = 0; i < vertices.Length; i++)
         {
-            // Simple triplanar mapping
+            // Simple planar mapping - can be improved with triplanar
             uvs[i] = new Vector2(vertices[i].x * 0.1f, vertices[i].z * 0.1f);
         }
         
         return uvs;
     }
     
-    void InitializeMarchingCubesTables()
+    int[] GenerateSequentialIndices(int count)
     {
-        // Initialize edge table
-        edgeTableBuffer = new ComputeBuffer(256, sizeof(int));
-        edgeTableBuffer.SetData(MarchingCubesTables.EdgeTable);
+        int[] indices = new int[count];
+        for (int i = 0; i < count; i++)
+        {
+            indices[i] = i;
+        }
+        return indices;
+    }
+    
+    public void GenerateNoisePreview(float height = 0f)
+    {
+        if (!isInitialized || noisePreviewTexture == null)
+            return;
         
-        // Initialize triangle table
-        triTableBuffer = new ComputeBuffer(256 * 16, sizeof(int));
-        triTableBuffer.SetData(MarchingCubesTables.TriTable);
+        UpdateNoiseLayerBuffer();
+        
+        noiseGenerationShader.SetTexture(generateNoisePreviewKernel, "PreviewTexture", noisePreviewTexture);
+        noiseGenerationShader.SetBuffer(generateNoisePreviewKernel, "Layers", noiseLayerBuffer);
+        noiseGenerationShader.SetInt("LayerCount", worldManager.noiseLayerStack.layers.Count);
+        noiseGenerationShader.SetFloat("PreviewHeight", height);
+        
+        int threadGroupsX = Mathf.CeilToInt(256 / 8f);
+        int threadGroupsY = Mathf.CeilToInt(256 / 8f);
+        noiseGenerationShader.Dispatch(generateNoisePreviewKernel, threadGroupsX, threadGroupsY, 1);
     }
     
     void OnDestroy()
     {
-        // Clean up buffers
-        if (densityBuffer != null && densityBuffer.IsValid())
-            densityBuffer.Release();
+        // Release all buffers
+        noiseLayerBuffer?.Release();
+        densityBuffer?.Release();
+        chamberBuffer?.Release();
+        vertexBuffer?.Release();
+        normalBuffer?.Release();
+        triangleBuffer?.Release();
+        counterBuffer?.Release();
+        edgeTableBuffer?.Release();
+        triTableBuffer?.Release();
         
-        if (noiseLayerBuffer != null && noiseLayerBuffer.IsValid())
-            noiseLayerBuffer.Release();
-            
-        if (chamberBuffer != null && chamberBuffer.IsValid())
-            chamberBuffer.Release();
-            
-        if (vertexBuffer != null && vertexBuffer.IsValid())
-            vertexBuffer.Release();
-            
-        if (triangleBuffer != null && triangleBuffer.IsValid())
-            triangleBuffer.Release();
-            
-        if (counterBuffer != null && counterBuffer.IsValid())
-            counterBuffer.Release();
-            
-        if (voxelOccupiedBuffer != null && voxelOccupiedBuffer.IsValid())
-            voxelOccupiedBuffer.Release();
-            
-        if (voxelVertexCountBuffer != null && voxelVertexCountBuffer.IsValid())
-            voxelVertexCountBuffer.Release();
-            
-        if (voxelVertexOffsetBuffer != null && voxelVertexOffsetBuffer.IsValid())
-            voxelVertexOffsetBuffer.Release();
-            
-        if (edgeTableBuffer != null && edgeTableBuffer.IsValid())
-            edgeTableBuffer.Release();
-            
-        if (triTableBuffer != null && triTableBuffer.IsValid())
-            triTableBuffer.Release();
-            
-        // Safely release render texture
         if (noisePreviewTexture != null)
         {
             noisePreviewTexture.Release();
-            if (Application.isPlaying)
-                Destroy(noisePreviewTexture);
-            else
-                DestroyImmediate(noisePreviewTexture);
-            noisePreviewTexture = null;
         }
     }
     
@@ -492,7 +608,107 @@ public class GPUChunkManager : MonoBehaviour
         if (showNoisePreview && noisePreviewTexture != null)
         {
             GUI.DrawTexture(new Rect(10, 10, 256, 256), noisePreviewTexture);
-            GUI.Label(new Rect(10, 270, 256, 20), "Noise Preview (2D Slice at Y=0)");
+        }
+    }
+    
+    // Performance testing methods
+    [ContextMenu("Test Pure GPU Speed")]
+    public void TestPureGPUSpeed()
+    {
+        if (!isInitialized)
+        {
+            Debug.LogError("GPU Manager not initialized!");
+            return;
+        }
+        
+        UpdateNoiseLayerBuffer();
+        
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Generate 10 chunks on GPU without any readback
+        for (int i = 0; i < 10; i++)
+        {
+            Vector3 chunkOrigin = new Vector3(i * CHUNK_SIZE * VOXEL_SIZE, 0, 0);
+            GenerateChunkOnGPU(chunkOrigin, 0);
+        }
+        
+        // Force GPU to finish by reading a single value
+        GL.Flush();
+        int[] dummy = new int[1];
+        counterBuffer.GetData(dummy, 0, 0, 1);
+        
+        sw.Stop();
+        Debug.Log($"Pure GPU time for 10 chunks: {sw.ElapsedMilliseconds}ms = {sw.ElapsedMilliseconds/10f}ms per chunk");
+    }
+    
+    [ContextMenu("Test With Async Readback")]
+    public void TestAsyncReadback()
+    {
+        StartCoroutine(TestAsyncReadbackCoroutine());
+    }
+    
+    IEnumerator TestAsyncReadbackCoroutine()
+    {
+        if (!isInitialized)
+        {
+            Debug.LogError("GPU Manager not initialized!");
+            yield break;
+        }
+        
+        UpdateNoiseLayerBuffer();
+        
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int completedChunks = 0;
+        
+        // Start 10 async requests
+        for (int i = 0; i < 10; i++)
+        {
+            Vector3 chunkOrigin = new Vector3(i * CHUNK_SIZE * VOXEL_SIZE, 0, 0);
+            
+            // Generate on GPU
+            GenerateChunkOnGPU(chunkOrigin, 0);
+            
+            // Async readback
+            AsyncGPUReadback.Request(counterBuffer, (request) =>
+            {
+                if (!request.hasError)
+                {
+                    var data = request.GetData<int>();
+                    int vertexCount = data[0];
+                    Debug.Log($"Async chunk completed with {vertexCount} vertices");
+                    completedChunks++;
+                }
+            });
+        }
+        
+        // Wait for all to complete
+        while (completedChunks < 10)
+        {
+            yield return null;
+        }
+        
+        sw.Stop();
+        Debug.Log($"Async GPU time for 10 chunks: {sw.ElapsedMilliseconds}ms = {sw.ElapsedMilliseconds/10f}ms per chunk");
+    }
+    
+    [ContextMenu("Benchmark Performance")]
+    public void BenchmarkPerformance()
+    {
+        Debug.Log("Starting GPU benchmark...");
+        float startTime = Time.realtimeSinceStartup;
+        
+        for (int i = 0; i < 10; i++)
+        {
+            RequestChunk(new GPUChunkRequest
+            {
+                coordinate = new Vector3Int(i * 2, 0, 0),
+                lodLevel = 0,
+                onComplete = (data) => 
+                {
+                    float elapsed = Time.realtimeSinceStartup - startTime;
+                    Debug.Log($"Chunk completed in {elapsed*1000:F1}ms with {data.vertices.Length} vertices");
+                }
+            });
         }
     }
 }
