@@ -209,7 +209,7 @@ public class GPUChunkManager : MonoBehaviour
         
         isProcessing = false;
     }
-    
+
     void GenerateChunkOnGPU(Vector3 chunkOrigin, int lodLevel)
     {
         // Dispatch noise generation
@@ -219,15 +219,18 @@ public class GPUChunkManager : MonoBehaviour
         noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "DensityField", densityBuffer);
         noiseGenerationShader.SetBuffer(generateNoiseFieldKernel, "ChamberCenters", chamberBuffer);
         noiseGenerationShader.SetInt("ChamberCount", 0);
-        
+
         int threadGroups = Mathf.CeilToInt((CHUNK_SIZE + 1) / 8f);
         noiseGenerationShader.Dispatch(generateNoiseFieldKernel, threadGroups, threadGroups, threadGroups);
-        
+
         // Reset buffers
         vertexBuffer.SetCounterValue(0);
         normalBuffer.SetCounterValue(0);
         triangleBuffer.SetCounterValue(0);
-        
+
+        // IMPORTANT: Copy the counter after reset
+        ComputeBuffer.CopyCount(vertexBuffer, counterBuffer, 0);
+
         // Dispatch mesh generation
         meshGenerationShader.SetVector("ChunkOrigin", chunkOrigin);
         meshGenerationShader.SetInt("LODLevel", lodLevel);
@@ -237,11 +240,14 @@ public class GPUChunkManager : MonoBehaviour
         meshGenerationShader.SetBuffer(marchingCubesKernel, "Triangles", triangleBuffer);
         meshGenerationShader.SetBuffer(marchingCubesKernel, "EdgeTable", edgeTableBuffer);
         meshGenerationShader.SetBuffer(marchingCubesKernel, "TriTable", triTableBuffer);
-        
+
         threadGroups = Mathf.CeilToInt(CHUNK_SIZE / 8f);
         meshGenerationShader.Dispatch(marchingCubesKernel, threadGroups, threadGroups, threadGroups);
+
+        // Copy the final count
+        ComputeBuffer.CopyCount(vertexBuffer, counterBuffer, 0);
     }
-    
+
     IEnumerator GenerateChunkAsync(GPUChunkRequest request)
     {
         if (!isInitialized || worldManager == null)
