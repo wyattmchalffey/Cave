@@ -1,0 +1,92 @@
+// MeshExtractionPool.compute - Uses Pool naming convention
+#pragma kernel ExtractMesh
+
+// World data texture
+Texture3D<float4> WorldData;
+
+// Output buffers - using Pool naming
+RWStructuredBuffer<float3> VertexPool;
+RWStructuredBuffer<float3> NormalPool;
+RWStructuredBuffer<int> IndexPool;
+RWStructuredBuffer<int> VertexCounter;
+
+// Chunk parameters
+float4 ChunkCoord;
+float VoxelSize;
+int ChunkSize;
+
+// Constants
+static const float ISO_LEVEL = 0.0;
+
+// Sample density
+float SampleDensity(int3 coord)
+{
+    int3 texCoord;
+    texCoord.x = (int)(ChunkCoord.x * ChunkSize) + coord.x;
+    texCoord.y = (int)(ChunkCoord.y * ChunkSize) + coord.y;
+    texCoord.z = (int)(ChunkCoord.z * ChunkSize) + coord.z;
+    
+    return WorldData[texCoord].x;
+}
+
+[numthreads(4, 4, 4)]
+void ExtractMesh(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (id.x >= (uint)(ChunkSize - 1) || id.y >= (uint)(ChunkSize - 1) || id.z >= (uint)(ChunkSize - 1))
+        return;
+    
+    // Convert to int3
+    int3 pos;
+    pos.x = (int)id.x;
+    pos.y = (int)id.y;
+    pos.z = (int)id.z;
+    
+    // Sample corners
+    float d0 = SampleDensity(pos);
+    float d1 = SampleDensity(pos + int3(1, 0, 0));
+    float d2 = SampleDensity(pos + int3(0, 1, 0));
+    float d3 = SampleDensity(pos + int3(0, 0, 1));
+    
+    // Check if surface crosses this voxel
+    bool b0 = d0 < ISO_LEVEL;
+    bool b1 = d1 < ISO_LEVEL;
+    bool b2 = d2 < ISO_LEVEL;
+    bool b3 = d3 < ISO_LEVEL;
+    
+    // Skip if all same
+    if (b0 == b1 && b0 == b2 && b0 == b3)
+        return;
+    
+    // Generate a simple triangle
+    float3 worldOffset = ChunkCoord.xyz * ChunkSize * VoxelSize;
+    float3 voxelPos = float3(pos) * VoxelSize + worldOffset;
+    
+    // Allocate vertices
+    int vertexIndex = 0;
+    InterlockedAdd(VertexCounter[0], 3, vertexIndex);
+    
+    if (vertexIndex + 3 > 65535)
+        return;
+    
+    // Create triangle vertices
+    float3 v0 = voxelPos;
+    float3 v1 = voxelPos + float3(VoxelSize, 0, 0);
+    float3 v2 = voxelPos + float3(0, VoxelSize, 0);
+    
+    // Simple normal
+    float3 normal = normalize(cross(v1 - v0, v2 - v0));
+    
+    // Write to pools
+    VertexPool[vertexIndex] = v0;
+    VertexPool[vertexIndex + 1] = v1;
+    VertexPool[vertexIndex + 2] = v2;
+    
+    NormalPool[vertexIndex] = normal;
+    NormalPool[vertexIndex + 1] = normal;
+    NormalPool[vertexIndex + 2] = normal;
+    
+    IndexPool[vertexIndex] = vertexIndex;
+    IndexPool[vertexIndex + 1] = vertexIndex + 1;
+    IndexPool[vertexIndex + 2] = vertexIndex + 2;
+}

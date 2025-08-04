@@ -1,0 +1,230 @@
+// MeshExtraction.compute - Marching cubes mesh extraction from density field
+#pragma kernel ExtractMesh
+
+// World data
+Texture3D<float4> WorldData;
+
+// Output buffers
+RWStructuredBuffer<float4> VertexPool; // xyz = position, w = materialID
+RWStructuredBuffer<float4> NormalPool; // xyz = normal, w = unused
+RWStructuredBuffer<uint> IndexPool;
+
+// Per-chunk data
+RWStructuredBuffer<uint> ChunkVertexCounts;
+RWStructuredBuffer<uint> ChunkVertexOffsets;
+
+// Global vertex counter
+RWStructuredBuffer<uint> GlobalVertexCounter;
+
+// Parameters
+float4 ChunkCoord;
+float VoxelSize;
+int ChunkSize;
+uint ChunkIndex;
+
+// Constants
+static const float ISO_LEVEL = 0.0;
+
+// Marching cubes edge table (256 entries)
+static const int edgeTable[256] = {
+        0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
+        0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
+        0x190, 0x99, 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
+        0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
+        0x230, 0x339, 0x33, 0x13a, 0x636, 0x73f, 0x435, 0x53c,
+        0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
+        0x3a0, 0x2a9, 0x1a3, 0xaa, 0x7a6, 0x6af, 0x5a5, 0x4ac,
+        0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
+        0x460, 0x569, 0x663, 0x76a, 0x66, 0x16f, 0x265, 0x36c,
+        0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
+        0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff, 0x3f5, 0x2fc,
+        0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
+        0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55, 0x15c,
+        0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
+        0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc,
+        0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
+        0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
+        0xcc, 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
+        0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
+        0x15c, 0x55, 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
+        0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
+        0x2fc, 0x3f5, 0xff, 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
+        0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
+        0x36c, 0x265, 0x16f, 0x66, 0x76a, 0x663, 0x569, 0x460,
+        0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
+        0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa, 0x1a3, 0x2a9, 0x3a0,
+        0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
+        0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33, 0x339, 0x230,
+        0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
+        0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99, 0x190,
+        0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
+        0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0,
+};
+
+// Corner offsets for marching cubes
+static const float3 cornerOffsets[8] = {
+    float3(0, 0, 0),
+    float3(1, 0, 0),
+    float3(1, 0, 1),
+    float3(0, 0, 1),
+    float3(0, 1, 0),
+    float3(1, 1, 0),
+    float3(1, 1, 1),
+    float3(0, 1, 1)
+};
+
+// Edge vertex indices
+static const int2 edgeVertices[12] = {
+    int2(0, 1), int2(1, 2), int2(2, 3), int2(3, 0),
+    int2(4, 5), int2(5, 6), int2(6, 7), int2(7, 4),
+    int2(0, 4), int2(1, 5), int2(2, 6), int2(3, 7)
+};
+
+// Sample density from world texture
+float sampleDensity(uint3 coord)
+{
+    uint3 texCoord = uint3(
+        ChunkCoord.x * ChunkSize + coord.x,
+        ChunkCoord.y * ChunkSize + coord.y,
+        ChunkCoord.z * ChunkSize + coord.z
+    );
+    
+    return WorldData[texCoord].x;
+}
+
+// Interpolate vertex position
+float3 interpolateVertex(float3 p1, float3 p2, float v1, float v2)
+{
+    if (abs(ISO_LEVEL - v1) < 0.00001)
+        return p1;
+    if (abs(ISO_LEVEL - v2) < 0.00001)
+        return p2;
+    if (abs(v1 - v2) < 0.00001)
+        return p1;
+    
+    float t = (ISO_LEVEL - v1) / (v2 - v1);
+    return lerp(p1, p2, t);
+}
+
+// Calculate normal using gradient
+float3 calculateNormal(float3 worldPos)
+{
+    float h = 0.5; // Half voxel size for gradient
+    
+    float dx = sampleDensity(uint3(worldPos + float3(h, 0, 0))) - 
+               sampleDensity(uint3(worldPos - float3(h, 0, 0)));
+    float dy = sampleDensity(uint3(worldPos + float3(0, h, 0))) - 
+               sampleDensity(uint3(worldPos - float3(0, h, 0)));
+    float dz = sampleDensity(uint3(worldPos + float3(0, 0, h))) - 
+               sampleDensity(uint3(worldPos - float3(0, 0, h)));
+    
+    return normalize(float3(dx, dy, dz));
+}
+
+[numthreads(8, 8, 8)]
+void ExtractMesh(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (any(id >= uint3(ChunkSize - 1, ChunkSize - 1, ChunkSize - 1)))
+        return;
+    
+    // Sample density at cube corners
+    float densities[8];
+    uint3 cornerCoords[8];
+    
+    for (int i = 0; i < 8; i++)
+    {
+        cornerCoords[i] = id + uint3(cornerOffsets[i]);
+        densities[i] = sampleDensity(cornerCoords[i]);
+    }
+    
+    // Calculate cube index
+    uint cubeIndex = 0;
+    if (densities[0] < ISO_LEVEL) cubeIndex |= 1;
+    if (densities[1] < ISO_LEVEL) cubeIndex |= 2;
+    if (densities[2] < ISO_LEVEL) cubeIndex |= 4;
+    if (densities[3] < ISO_LEVEL) cubeIndex |= 8;
+    if (densities[4] < ISO_LEVEL) cubeIndex |= 16;
+    if (densities[5] < ISO_LEVEL) cubeIndex |= 32;
+    if (densities[6] < ISO_LEVEL) cubeIndex |= 64;
+    if (densities[7] < ISO_LEVEL) cubeIndex |= 128;
+    
+    // Skip if cube is entirely inside or outside
+    int edgeFlags = edgeTable[cubeIndex];
+    if (edgeFlags == 0)
+        return;
+    
+    // Calculate edge intersections
+    float3 vertexPositions[12];
+    
+    if (edgeFlags & 1)
+        vertexPositions[0] = interpolateVertex(float3(cornerCoords[0]), float3(cornerCoords[1]), densities[0], densities[1]);
+    if (edgeFlags & 2)
+        vertexPositions[1] = interpolateVertex(float3(cornerCoords[1]), float3(cornerCoords[2]), densities[1], densities[2]);
+    if (edgeFlags & 4)
+        vertexPositions[2] = interpolateVertex(float3(cornerCoords[2]), float3(cornerCoords[3]), densities[2], densities[3]);
+    if (edgeFlags & 8)
+        vertexPositions[3] = interpolateVertex(float3(cornerCoords[3]), float3(cornerCoords[0]), densities[3], densities[0]);
+    if (edgeFlags & 16)
+        vertexPositions[4] = interpolateVertex(float3(cornerCoords[4]), float3(cornerCoords[5]), densities[4], densities[5]);
+    if (edgeFlags & 32)
+        vertexPositions[5] = interpolateVertex(float3(cornerCoords[5]), float3(cornerCoords[6]), densities[5], densities[6]);
+    if (edgeFlags & 64)
+        vertexPositions[6] = interpolateVertex(float3(cornerCoords[6]), float3(cornerCoords[7]), densities[6], densities[7]);
+    if (edgeFlags & 128)
+        vertexPositions[7] = interpolateVertex(float3(cornerCoords[7]), float3(cornerCoords[4]), densities[7], densities[4]);
+    if (edgeFlags & 256)
+        vertexPositions[8] = interpolateVertex(float3(cornerCoords[0]), float3(cornerCoords[4]), densities[0], densities[4]);
+    if (edgeFlags & 512)
+        vertexPositions[9] = interpolateVertex(float3(cornerCoords[1]), float3(cornerCoords[5]), densities[1], densities[5]);
+    if (edgeFlags & 1024)
+        vertexPositions[10] = interpolateVertex(float3(cornerCoords[2]), float3(cornerCoords[6]), densities[2], densities[6]);
+    if (edgeFlags & 2048)
+        vertexPositions[11] = interpolateVertex(float3(cornerCoords[3]), float3(cornerCoords[7]), densities[3], densities[7]);
+    
+    // Generate triangles based on configuration
+    // For now, we'll use a simplified approach
+    // In production, you'd use the full tri table
+    
+    uint vertexCount = 0;
+    for (int e = 0; e < 12; e++)
+    {
+        if (edgeFlags & (1 << e))
+            vertexCount++;
+    }
+    
+    if (vertexCount >= 3)
+    {
+        // Allocate vertices
+        uint baseVertex;
+        InterlockedAdd(GlobalVertexCounter[0], 3, baseVertex);
+        
+        // Store vertex count for this chunk
+        InterlockedAdd(ChunkVertexCounts[ChunkIndex], 3);
+        
+        // Calculate world positions
+        float3 worldBase = ChunkCoord.xyz * ChunkSize * VoxelSize;
+        uint vertexOffset = ChunkVertexOffsets[ChunkIndex] + baseVertex;
+        
+        // Write first triangle (simplified - should use tri table)
+        if (edgeFlags & 1 && edgeFlags & 2 && edgeFlags & 4)
+        {
+            float3 p0 = vertexPositions[0] * VoxelSize + worldBase;
+            float3 p1 = vertexPositions[1] * VoxelSize + worldBase;
+            float3 p2 = vertexPositions[2] * VoxelSize + worldBase;
+            
+            VertexPool[vertexOffset] = float4(p0, 1.0);
+            VertexPool[vertexOffset + 1] = float4(p1, 1.0);
+            VertexPool[vertexOffset + 2] = float4(p2, 1.0);
+            
+            float3 normal = normalize(cross(p1 - p0, p2 - p0));
+            NormalPool[vertexOffset] = float4(normal, 0.0);
+            NormalPool[vertexOffset + 1] = float4(normal, 0.0);
+            NormalPool[vertexOffset + 2] = float4(normal, 0.0);
+            
+            IndexPool[vertexOffset * 3] = vertexOffset;
+            IndexPool[vertexOffset * 3 + 1] = vertexOffset + 1;
+            IndexPool[vertexOffset * 3 + 2] = vertexOffset + 2;
+        }
+    }
+}

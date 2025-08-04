@@ -1,0 +1,157 @@
+// TerrainGeneration.compute - GPU terrain density field generation
+#pragma kernel GenerateTerrain
+#pragma kernel ClearWorld
+
+// World data texture - stores density and attributes per voxel
+RWTexture3D<float4> WorldData;
+
+// Generation parameters
+float4 ChunkCoord; // xyz = chunk coordinate, w unused
+float VoxelSize;
+int ChunkSize;
+
+// Cave generation parameters
+float CaveFrequency;
+float CaveAmplitude;
+int Octaves;
+float Lacunarity;
+float Persistence;
+float MinCaveHeight;
+float MaxCaveHeight;
+
+// Constants
+static const float PI = 3.14159265359;
+
+// Simple hash function for randomness
+uint hash(uint x)
+{
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = ((x >> 16) ^ x) * 0x45d9f3b;
+    x = (x >> 16) ^ x;
+    return x;
+}
+
+// 3D noise function (simplified Perlin noise)
+float noise3D(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    
+    // Generate corner hashes
+    uint n = uint(i.x) + uint(i.y) * 57 + uint(i.z) * 113;
+    
+    float a = float(hash(n)) / float(0xffffffffU);
+    float b = float(hash(n + 1)) / float(0xffffffffU);
+    float c = float(hash(n + 57)) / float(0xffffffffU);
+    float d = float(hash(n + 58)) / float(0xffffffffU);
+    float e = float(hash(n + 113)) / float(0xffffffffU);
+    float f1 = float(hash(n + 114)) / float(0xffffffffU);
+    float g = float(hash(n + 170)) / float(0xffffffffU);
+    float h = float(hash(n + 171)) / float(0xffffffffU);
+    
+    float k0 = a;
+    float k1 = b - a;
+    float k2 = c - a;
+    float k3 = e - a;
+    float k4 = a - b - c + d;
+    float k5 = a - c - e + g;
+    float k6 = a - b - e + f1;
+    float k7 = -a + b + c - d + e - f1 - g + h;
+    
+    return k0 + k1 * f.x + k2 * f.y + k3 * f.z + 
+           k4 * f.x * f.y + k5 * f.y * f.z + k6 * f.z * f.x + 
+           k7 * f.x * f.y * f.z;
+}
+
+// Fractal Brownian Motion
+float fbm(float3 p, int octaves, float frequency, float amplitude, float lacunarity, float persistence)
+{
+    float value = 0.0;
+    float amp = amplitude;
+    float freq = frequency;
+    
+    for (int i = 0; i < octaves; i++)
+    {
+        value += noise3D(p * freq) * amp;
+        freq *= lacunarity;
+        amp *= persistence;
+    }
+    
+    return value;
+}
+
+// Cave density function
+float caveDensity(float3 worldPos)
+{
+    // Base 3D noise for cave structure
+    float density = fbm(worldPos, Octaves, CaveFrequency, CaveAmplitude, Lacunarity, Persistence);
+    
+    // Height gradient - caves become less likely near surface
+    float heightGradient = 1.0;
+    if (worldPos.y > MaxCaveHeight - 20.0)
+    {
+        float t = (worldPos.y - (MaxCaveHeight - 20.0)) / 20.0;
+        heightGradient = 1.0 - smoothstep(0.0, 1.0, t);
+    }
+    
+    // Apply height constraints
+    if (worldPos.y < MinCaveHeight || worldPos.y > MaxCaveHeight)
+    {
+        return 1.0; // Solid rock outside height range
+    }
+    
+    // Combine density with height gradient
+    density = lerp(density, 1.0, 1.0 - heightGradient);
+    
+    // Add some variety with secondary noise
+    float detail = noise3D(worldPos * 0.1) * 0.1;
+    density += detail;
+    
+    return density;
+}
+
+// Thread group size 8x8x8
+[numthreads(8, 8, 8)]
+void GenerateTerrain(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (any(id >= uint3(ChunkSize, ChunkSize, ChunkSize)))
+        return;
+    
+    // Calculate world position
+    float3 chunkWorldPos = ChunkCoord.xyz * ChunkSize * VoxelSize;
+    float3 localPos = float3(id) * VoxelSize;
+    float3 worldPos = chunkWorldPos + localPos;
+    
+    // Generate density value
+    float density = caveDensity(worldPos);
+    
+    // Material ID based on depth (for now, simple stratification)
+    float materialID = 0.0;
+    if (worldPos.y < -20.0) materialID = 1.0; // Deep rock
+    else if (worldPos.y < 0.0) materialID = 2.0; // Mid rock
+    else materialID = 3.0; // Surface rock
+    
+    // Temperature and moisture (placeholder values for ecosystem)
+    float temperature = 0.5 + noise3D(worldPos * 0.01) * 0.3;
+    float moisture = 0.5 + noise3D(worldPos * 0.015 + float3(100, 100, 100)) * 0.3;
+    
+    // Calculate texture coordinate
+    uint3 texCoord = uint3(
+        ChunkCoord.x * ChunkSize + id.x,
+        ChunkCoord.y * ChunkSize + id.y,
+        ChunkCoord.z * ChunkSize + id.z
+    );
+    
+    // Write to world texture
+    WorldData[texCoord] = float4(density, materialID, temperature, moisture);
+}
+
+// Clear world kernel - initializes world to solid rock
+[numthreads(8, 8, 8)]
+void ClearWorld(uint3 id : SV_DispatchThreadID)
+{
+    // Initialize to solid rock
+    WorldData[id] = float4(1.0, 0.0, 0.5, 0.5);
+}

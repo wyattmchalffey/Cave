@@ -1,0 +1,79 @@
+// TestTerrainGeneration.compute - Simplified terrain generation for testing
+#pragma kernel GenerateTerrain
+#pragma kernel ClearWorld
+
+// World data texture
+RWTexture3D<float4> WorldData;
+
+// Parameters
+float4 ChunkCoord;
+float VoxelSize;
+int ChunkSize;
+
+// Generation parameters (simplified)
+float CaveFrequency;
+float CaveAmplitude;
+int Octaves;
+float Lacunarity;
+float Persistence;
+float MinCaveHeight;
+float MaxCaveHeight;
+
+[numthreads(8, 8, 8)]
+void GenerateTerrain(uint3 id : SV_DispatchThreadID)
+{
+    // Check bounds
+    if (any(id >= uint3(ChunkSize, ChunkSize, ChunkSize)))
+        return;
+    
+    // Calculate world position
+    float3 chunkWorldPos = ChunkCoord.xyz * ChunkSize * VoxelSize;
+    float3 localPos = float3(id) * VoxelSize;
+    float3 worldPos = chunkWorldPos + localPos;
+    
+    // Simple terrain generation for testing
+    float density = 1.0; // Start solid
+    
+    // Create a simple cave sphere
+    float3 caveCenter = float3(64, 25, 64); // Center of world
+    float caveRadius = 20.0;
+    float distance = length(worldPos - caveCenter);
+    
+    if (distance < caveRadius)
+    {
+        density = (distance / caveRadius) - 1.0;
+    }
+    
+    // Add ground plane
+    if (worldPos.y < 10)
+    {
+        density = 1.0;
+    }
+    else if (worldPos.y < 15)
+    {
+        // Transition zone
+        float t = (worldPos.y - 10) / 5.0;
+        density = lerp(1.0, density, t);
+    }
+    
+    // Add some noise for variation
+    float noise = sin(worldPos.x * 0.1) * cos(worldPos.z * 0.1) * 2.0;
+    density += noise * 0.1;
+    
+    // Calculate texture coordinate
+    uint3 texCoord = uint3(
+        ChunkCoord.x * ChunkSize + id.x,
+        ChunkCoord.y * ChunkSize + id.y,
+        ChunkCoord.z * ChunkSize + id.z
+    );
+    
+    // Write to world texture
+    WorldData[texCoord] = float4(density, 0, 0.5, 0.5);
+}
+
+[numthreads(8, 8, 8)]
+void ClearWorld(uint3 id : SV_DispatchThreadID)
+{
+    // Initialize to solid rock
+    WorldData[id] = float4(1.0, 0.0, 0.5, 0.5);
+}
