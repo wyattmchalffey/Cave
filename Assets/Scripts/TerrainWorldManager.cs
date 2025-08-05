@@ -252,6 +252,8 @@ namespace GPUTerrain
             // Clear world data
             if (terrainGenerationShader != null && clearWorldKernel >= 0)
             {
+                Debug.Log($"Clearing world data texture: {worldSizeChunks * CHUNK_SIZE} x {worldHeightChunks * CHUNK_SIZE} x {worldSizeChunks * CHUNK_SIZE}");
+                
                 terrainGenerationShader.SetTexture(clearWorldKernel, "WorldData", worldDataTexture);
                 
                 int texSize = worldSizeChunks * CHUNK_SIZE;
@@ -260,6 +262,12 @@ namespace GPUTerrain
                 int threadGroupsY = Mathf.CeilToInt(texHeight / 8.0f);
                 
                 terrainGenerationShader.Dispatch(clearWorldKernel, threadGroups, threadGroupsY, threadGroups);
+                
+                Debug.Log("World data cleared to solid (density = 1.0)");
+            }
+            else
+            {
+                Debug.LogWarning("Cannot clear world data - shader or kernel not ready");
             }
             
             // Initialize chunk states
@@ -368,6 +376,8 @@ namespace GPUTerrain
                 return;
             }
             
+            Debug.Log($"Generating chunk {chunkCoord}");
+            
             // Set parameters
             terrainGenerationShader.SetTexture(generateTerrainKernel, "WorldData", worldDataTexture);
             terrainGenerationShader.SetVector("ChunkCoord", new Vector4(chunkCoord.x, chunkCoord.y, chunkCoord.z, 0));
@@ -378,6 +388,17 @@ namespace GPUTerrain
             if (generationSettings != null)
             {
                 generationSettings.ApplyToComputeShader(terrainGenerationShader, generateTerrainKernel);
+            }
+            else
+            {
+                // Use simple default values for testing
+                terrainGenerationShader.SetFloat("CaveFrequency", 0.02f);
+                terrainGenerationShader.SetFloat("CaveAmplitude", 1.0f);
+                terrainGenerationShader.SetInt("Octaves", 4);
+                terrainGenerationShader.SetFloat("Lacunarity", 2.0f);
+                terrainGenerationShader.SetFloat("Persistence", 0.5f);
+                terrainGenerationShader.SetFloat("MinCaveHeight", -50f);
+                terrainGenerationShader.SetFloat("MaxCaveHeight", 100f);
             }
             
             // Dispatch
@@ -390,6 +411,7 @@ namespace GPUTerrain
                 var state = chunkStates[chunkCoord];
                 state.isGenerated = true;
                 chunkStates[chunkCoord] = state;
+                Debug.Log($"Chunk {chunkCoord} marked as generated");
             }
         }
         
