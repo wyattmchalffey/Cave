@@ -5,18 +5,18 @@ using Unity.Mathematics;
 namespace GPUTerrain
 {
     // Must match the struct in shaders exactly
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
     public struct ChunkMetadata
     {
-        public float3 position;      // World position of chunk origin
-        public uint vertexOffset;    // Offset into global vertex pool
-        public uint vertexCount;     // Number of vertices in this chunk
-        public uint indexOffset;     // Offset into global index pool
-        public uint lodLevel;        // Level of detail (0 = highest)
-        public uint flags;           // Bit flags (visible, dirty, etc.)
-        public float3 _padding;      // Padding to 64 bytes for alignment
+        [FieldOffset(0)] public float3 position;      // World position of chunk origin (12 bytes)
+        [FieldOffset(12)] public uint vertexOffset;   // Offset into global vertex pool (4 bytes)
+        [FieldOffset(16)] public uint vertexCount;    // Number of vertices in this chunk (4 bytes)
+        [FieldOffset(20)] public uint indexOffset;    // Offset into global index pool (4 bytes)
+        [FieldOffset(24)] public uint lodLevel;       // Level of detail (0 = highest) (4 bytes)
+        [FieldOffset(28)] public uint flags;          // Bit flags (visible, dirty, etc.) (4 bytes)
+        // Total used: 32 bytes, struct size forced to 64 bytes
         
-        public static int Size => sizeof(float) * 16; // 64 bytes
+        public static int Size => 64;
         
         // Flag constants
         public const uint FLAG_VISIBLE = 1 << 0;
@@ -87,6 +87,61 @@ namespace GPUTerrain
             const uint p3 = 83492791;
             
             return (x * p1) ^ (y * p2) ^ (z * p3);
+        }
+        
+        public static int ChunkIndex(int3 coord, int worldSizeX, int worldSizeY, int worldSizeZ)
+        {
+            if (coord.x < 0 || coord.x >= worldSizeX ||
+                coord.y < 0 || coord.y >= worldSizeY ||
+                coord.z < 0 || coord.z >= worldSizeZ)
+            {
+                return -1; // Out of bounds
+            }
+            
+            return coord.x + coord.y * worldSizeX + coord.z * worldSizeX * worldSizeY;
+        }
+        
+        public static int3 IndexToChunk(int index, int worldSizeX, int worldSizeY, int worldSizeZ)
+        {
+            int z = index / (worldSizeX * worldSizeY);
+            int y = (index % (worldSizeX * worldSizeY)) / worldSizeX;
+            int x = index % worldSizeX;
+            
+            return new int3(x, y, z);
+        }
+        
+        public static float DistanceToChunk(float3 worldPos, int3 chunkCoord, float voxelSize, int chunkSize)
+        {
+            float3 chunkCenter = ChunkToWorld(chunkCoord, voxelSize, chunkSize) + (voxelSize * chunkSize * 0.5f);
+            return math.distance(worldPos, chunkCenter);
+        }
+        
+        public static bool IsChunkInRange(float3 worldPos, int3 chunkCoord, float range, float voxelSize, int chunkSize)
+        {
+            return DistanceToChunk(worldPos, chunkCoord, voxelSize, chunkSize) <= range;
+        }
+    }
+    
+    // Debug utilities
+    public static class ChunkDebugInfo
+    {
+        public static string GetChunkInfo(ChunkMetadata chunk)
+        {
+            return $"Chunk at {chunk.position}: " +
+                   $"Vertices={chunk.vertexCount} (offset={chunk.vertexOffset}), " +
+                   $"LOD={chunk.lodLevel}, " +
+                   $"Flags={GetFlagsString(chunk.flags)}";
+        }
+        
+        public static string GetFlagsString(uint flags)
+        {
+            string result = "";
+            if ((flags & ChunkMetadata.FLAG_VISIBLE) != 0) result += "Visible ";
+            if ((flags & ChunkMetadata.FLAG_DIRTY) != 0) result += "Dirty ";
+            if ((flags & ChunkMetadata.FLAG_GENERATING) != 0) result += "Generating ";
+            if ((flags & ChunkMetadata.FLAG_HAS_MESH) != 0) result += "HasMesh ";
+            if ((flags & ChunkMetadata.FLAG_EMPTY) != 0) result += "Empty ";
+            return result.Trim();
         }
     }
 }

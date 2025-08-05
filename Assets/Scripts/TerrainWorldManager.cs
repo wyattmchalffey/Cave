@@ -19,12 +19,17 @@ namespace GPUTerrain
         [SerializeField] private Material terrainMaterial;
         
         [Header("World Settings")]
-        [SerializeField] private int worldSizeChunks = 8;
-        [SerializeField] private int worldHeightChunks = 4;
-        [SerializeField] private float voxelSize = 0.5f;
+        [SerializeField] private int worldSizeChunks = 16;
+        [SerializeField] private int worldHeightChunks = 8;
+        [SerializeField] private float voxelSize = 0.25f;
+        [SerializeField] private int viewDistance = 5;
         
         [Header("Generation Settings")]
         [SerializeField] private TerrainGenerationSettings generationSettings;
+        
+        [Header("Performance")]
+        [SerializeField] private int chunksPerFrame = 4;
+        [SerializeField] private float updateInterval = 0.1f;
         
         // Constants
         public const int CHUNK_SIZE = 32;
@@ -39,11 +44,14 @@ namespace GPUTerrain
         private ComputeBuffer indexPoolBuffer;
         private ComputeBuffer drawArgsBuffer;
         private ComputeBuffer visibleChunksBuffer;
+        private ComputeBuffer updateCommandBuffer;
         
         // World state
         private Dictionary<int3, ChunkState> chunkStates = new Dictionary<int3, ChunkState>();
         private Queue<ChunkUpdateCommand> updateQueue = new Queue<ChunkUpdateCommand>();
+        private HashSet<int3> chunksInQueue = new HashSet<int3>();
         private Camera mainCamera;
+        private Transform playerTransform;
         
         // Compute shader kernels
         private int generateTerrainKernel = -1;
@@ -52,13 +60,21 @@ namespace GPUTerrain
         private int updateWorldKernel = -1;
         private int frustumCullKernel = -1;
         
+        // Statistics
+        private int totalChunksGenerated = 0;
+        private int totalChunksWithMesh = 0;
+        
         // Public properties
         public int WorldSizeChunks => worldSizeChunks;
         public int WorldHeightChunks => worldHeightChunks;
         public float VoxelSize => voxelSize;
-        public Dictionary<int3, ChunkState> GetChunkStates() => chunkStates;
+        public Dictionary<int3, ChunkState> GetChunkStates() => new Dictionary<int3, ChunkState>(chunkStates);
         public int GetUpdateQueueSize() => updateQueue.Count;
         public RenderTexture GetWorldDataTexture() => worldDataTexture;
+        
+        // Events
+        public System.Action<int3> OnChunkGenerated;
+        public System.Action<int3> OnChunkMeshBuilt;
         
         // Data structures
         public struct ChunkState
@@ -66,22 +82,27 @@ namespace GPUTerrain
             public int3 coordinate;
             public bool isGenerated;
             public bool hasMesh;
+            public bool isGenerating;
             public int vertexCount;
             public int vertexOffset;
+            public float lastAccessTime;
+            public int lodLevel;
         }
         
         public struct ChunkUpdateCommand
         {
-            public enum CommandType { Generate, Modify, Extract }
+            public enum CommandType { Generate, Modify, Extract, Regenerate }
             public CommandType type;
             public int3 chunkCoord;
             public float3 modifyCenter;
             public float modifyRadius;
+            public float modifyStrength;
         }
         
         void Awake()
         {
             ValidateComponents();
+            FindPlayer();
         }
         
         void Start()
@@ -102,6 +123,7 @@ namespace GPUTerrain
             }
             
             StartCoroutine(WorldUpdateLoop());
+            StartCoroutine(ChunkMaintenanceLoop());
         }
         
         void ValidateComponents()
@@ -113,7 +135,40 @@ namespace GPUTerrain
                 Debug.LogError("Mesh Extraction Shader not assigned!");
             
             if (terrainMaterial == null)
-                Debug.LogWarning("Terrain Material not assigned!");
+            {
+                Debug.LogWarning("Terrain Material not assigned! Using default.");
+                terrainMaterial = new Material(Shader.Find("Standard"));
+            }
+            
+            // Validate world size
+            worldSizeChunks = Mathf.Clamp(worldSizeChunks, 4, 64);
+            worldHeightChunks = Mathf.Clamp(worldHeightChunks, 2, 32);
+            voxelSize = Mathf.Clamp(voxelSize, 0.1f, 2f);
+            viewDistance = Mathf.Clamp(viewDistance, 2, 16);
+        }
+        
+        void FindPlayer()
+        {
+            // Try to find player by tag first
+            GameObject playerGO = GameObject.FindGameObjectWithTag("Player");
+            if (playerGO != null)
+            {
+                playerTransform = playerGO.transform;
+            }
+            else
+            {
+                // Try to find by component
+                var controller = FindFirstObjectByType<TerrainTestController>();
+                if (controller != null)
+                {
+                    playerTransform = controller.transform;
+                }
+            }
+            
+            if (playerTransform == null)
+            {
+                Debug.LogWarning("No player found - using camera as player position");
+            }
         }
         
         bool InitializeSystem()
@@ -142,6 +197,11 @@ namespace GPUTerrain
             {
                 meshBuilder.SetWorldDataTexture(worldDataTexture);
             }
+            else
+            {
+                Debug.LogWarning("No ChunkMeshBuilder component found - adding one");
+                gameObject.AddComponent<ChunkMeshBuilder>();
+            }
             
             return true;
         }
@@ -150,6 +210,10 @@ namespace GPUTerrain
         {
             try
             {
+                // Debug: Check struct size
+                int actualSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(ChunkMetadata));
+                Debug.Log($"ChunkMetadata actual size: {actualSize} bytes, expected: {ChunkMetadata.Size} bytes");
+                
                 // Create 3D world data texture
                 int texSize = worldSizeChunks * CHUNK_SIZE;
                 int texHeight = worldHeightChunks * CHUNK_SIZE;
@@ -160,6 +224,7 @@ namespace GPUTerrain
                 worldDataTexture.enableRandomWrite = true;
                 worldDataTexture.filterMode = FilterMode.Bilinear;
                 worldDataTexture.wrapMode = TextureWrapMode.Clamp;
+                worldDataTexture.name = "WorldDataTexture";
                 worldDataTexture.Create();
                 
                 if (!worldDataTexture.IsCreated())
@@ -172,16 +237,42 @@ namespace GPUTerrain
                 int totalChunks = worldSizeChunks * worldHeightChunks * worldSizeChunks;
                 chunkMetadataBuffer = new ComputeBuffer(totalChunks, ChunkMetadata.Size);
                 
+                // Initialize chunk metadata
+                ChunkMetadata[] initialMetadata = new ChunkMetadata[totalChunks];
+                for (int i = 0; i < totalChunks; i++)
+                {
+                    initialMetadata[i] = new ChunkMetadata
+                    {
+                        position = float3.zero,
+                        vertexOffset = 0,
+                        vertexCount = 0,
+                        indexOffset = 0,
+                        lodLevel = 0,
+                        flags = 0
+                    };
+                }
+                chunkMetadataBuffer.SetData(initialMetadata);
+                
+                // Vertex and index pools
                 int totalVertices = MAX_VERTICES_PER_CHUNK * MAX_CHUNKS;
                 vertexPoolBuffer = new ComputeBuffer(totalVertices, TerrainVertex.Size);
                 indexPoolBuffer = new ComputeBuffer(totalVertices * 3, sizeof(uint));
                 
+                // Draw args for indirect rendering
                 drawArgsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
                 drawArgsBuffer.SetData(new uint[] { 0, 1, 0, 0, 0 });
                 
+                // Visible chunks buffer
                 visibleChunksBuffer = new ComputeBuffer(MAX_CHUNKS, ChunkMetadata.Size, ComputeBufferType.Append);
                 
-                Debug.Log($"GPU resources initialized. World texture: {texSize}x{texHeight}x{texSize}");
+                // Update command buffer
+                updateCommandBuffer = new ComputeBuffer(64, WorldUpdateCommand.Size);
+                
+                Debug.Log($"GPU resources initialized successfully:");
+                Debug.Log($"  World texture: {texSize}x{texHeight}x{texSize} ({(texSize * texHeight * texSize * 16) / (1024f * 1024f):F1} MB)");
+                Debug.Log($"  Total chunks capacity: {totalChunks}");
+                Debug.Log($"  Vertex pool: {totalVertices} vertices ({(totalVertices * TerrainVertex.Size) / (1024f * 1024f):F1} MB)");
+                
                 return true;
             }
             catch (System.Exception e)
@@ -227,21 +318,37 @@ namespace GPUTerrain
                 catch (System.Exception e)
                 {
                     Debug.LogError($"Failed to find mesh extraction kernel: {e.Message}");
-                    success = false;
+                    // Don't fail completely - mesh extraction is handled by ChunkMeshBuilder
                 }
             }
             
             // Optional shaders
             if (worldUpdateShader != null)
             {
-                try { updateWorldKernel = worldUpdateShader.FindKernel("UpdateWorld"); }
-                catch { updateWorldKernel = -1; }
+                try 
+                { 
+                    updateWorldKernel = worldUpdateShader.FindKernel("UpdateWorld");
+                    Debug.Log($"Found world update kernel: {updateWorldKernel}");
+                }
+                catch 
+                { 
+                    updateWorldKernel = -1;
+                    Debug.LogWarning("World update kernel not found - terrain modification disabled");
+                }
             }
             
             if (frustumCullingShader != null)
             {
-                try { frustumCullKernel = frustumCullingShader.FindKernel("FrustumCull"); }
-                catch { frustumCullKernel = -1; }
+                try 
+                { 
+                    frustumCullKernel = frustumCullingShader.FindKernel("FrustumCull");
+                    Debug.Log($"Found frustum culling kernel: {frustumCullKernel}");
+                }
+                catch 
+                { 
+                    frustumCullKernel = -1;
+                    Debug.LogWarning("Frustum culling kernel not found - GPU culling disabled");
+                }
             }
             
             return success;
@@ -252,7 +359,7 @@ namespace GPUTerrain
             // Clear world data
             if (terrainGenerationShader != null && clearWorldKernel >= 0)
             {
-                Debug.Log($"Clearing world data texture: {worldSizeChunks * CHUNK_SIZE} x {worldHeightChunks * CHUNK_SIZE} x {worldSizeChunks * CHUNK_SIZE}");
+                Debug.Log("Clearing world data...");
                 
                 terrainGenerationShader.SetTexture(clearWorldKernel, "WorldData", worldDataTexture);
                 
@@ -263,15 +370,15 @@ namespace GPUTerrain
                 
                 terrainGenerationShader.Dispatch(clearWorldKernel, threadGroups, threadGroupsY, threadGroups);
                 
-                Debug.Log("World data cleared to solid (density = 1.0)");
-            }
-            else
-            {
-                Debug.LogWarning("Cannot clear world data - shader or kernel not ready");
+                Debug.Log("World data cleared");
             }
             
             // Initialize chunk states
             chunkStates.Clear();
+            chunksInQueue.Clear();
+            totalChunksGenerated = 0;
+            totalChunksWithMesh = 0;
+            
             for (int y = 0; y < worldHeightChunks; y++)
             {
                 for (int z = 0; z < worldSizeChunks; z++)
@@ -284,8 +391,11 @@ namespace GPUTerrain
                             coordinate = coord,
                             isGenerated = false,
                             hasMesh = false,
+                            isGenerating = false,
                             vertexCount = 0,
-                            vertexOffset = 0
+                            vertexOffset = 0,
+                            lastAccessTime = 0,
+                            lodLevel = 0
                         };
                     }
                 }
@@ -298,19 +408,43 @@ namespace GPUTerrain
         {
             while (true)
             {
+                float startTime = Time.realtimeSinceStartup;
+                
                 ProcessUpdateQueue();
                 UpdateVisibleChunks();
-                yield return new WaitForSeconds(0.1f);
+                
+                float elapsed = Time.realtimeSinceStartup - startTime;
+                if (elapsed > 0.016f) // More than 16ms
+                {
+                    Debug.LogWarning($"World update took {elapsed * 1000:F1}ms");
+                }
+                
+                yield return new WaitForSeconds(updateInterval);
+            }
+        }
+        
+        IEnumerator ChunkMaintenanceLoop()
+        {
+            yield return new WaitForSeconds(5f); // Initial delay
+            
+            while (true)
+            {
+                // Periodic maintenance tasks
+                CleanupDistantChunks();
+                UpdateChunkLODs();
+                
+                yield return new WaitForSeconds(2f);
             }
         }
         
         void ProcessUpdateQueue()
         {
-            int commandsPerFrame = 4;
+            int commandsThisFrame = 0;
             
-            while (updateQueue.Count > 0 && commandsPerFrame > 0)
+            while (updateQueue.Count > 0 && commandsThisFrame < chunksPerFrame)
             {
                 var command = updateQueue.Dequeue();
+                chunksInQueue.Remove(command.chunkCoord);
                 
                 switch (command.type)
                 {
@@ -321,11 +455,14 @@ namespace GPUTerrain
                         ExtractChunkMesh(command.chunkCoord);
                         break;
                     case ChunkUpdateCommand.CommandType.Modify:
-                        ModifyTerrain(command.modifyCenter, command.modifyRadius);
+                        ModifyTerrain(command.modifyCenter, command.modifyRadius, command.modifyStrength);
+                        break;
+                    case ChunkUpdateCommand.CommandType.Regenerate:
+                        RegenerateChunk(command.chunkCoord);
                         break;
                 }
                 
-                commandsPerFrame--;
+                commandsThisFrame++;
             }
         }
         
@@ -333,11 +470,10 @@ namespace GPUTerrain
         {
             if (mainCamera == null) return;
             
-            float3 cameraPos = mainCamera.transform.position;
-            int3 cameraChunk = WorldToChunkCoord(cameraPos);
+            float3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
+            int3 viewerChunk = WorldToChunkCoord(viewerPos);
             
-            int viewDistance = 4;
-            
+            // Update chunk visibility based on distance
             for (int y = 0; y < worldHeightChunks; y++)
             {
                 for (int z = -viewDistance; z <= viewDistance; z++)
@@ -345,21 +481,29 @@ namespace GPUTerrain
                     for (int x = -viewDistance; x <= viewDistance; x++)
                     {
                         int3 chunkCoord = new int3(
-                            cameraChunk.x + x,
+                            viewerChunk.x + x,
                             y,
-                            cameraChunk.z + z
+                            viewerChunk.z + z
                         );
                         
                         // Check bounds
-                        if (chunkCoord.x >= 0 && chunkCoord.x < worldSizeChunks &&
-                            chunkCoord.z >= 0 && chunkCoord.z < worldSizeChunks)
+                        if (IsChunkInBounds(chunkCoord))
                         {
-                            if (chunkStates.ContainsKey(chunkCoord))
+                            float distance = math.length(new float3(x, 0, z));
+                            
+                            if (distance <= viewDistance)
                             {
-                                var state = chunkStates[chunkCoord];
-                                if (!state.isGenerated)
+                                if (chunkStates.TryGetValue(chunkCoord, out ChunkState state))
                                 {
-                                    QueueChunkGeneration(chunkCoord);
+                                    // Update last access time
+                                    state.lastAccessTime = Time.time;
+                                    chunkStates[chunkCoord] = state;
+                                    
+                                    // Queue for generation if needed
+                                    if (!state.isGenerated && !state.isGenerating && !chunksInQueue.Contains(chunkCoord))
+                                    {
+                                        QueueChunkGeneration(chunkCoord);
+                                    }
                                 }
                             }
                         }
@@ -376,7 +520,12 @@ namespace GPUTerrain
                 return;
             }
             
-            Debug.Log($"Generating chunk {chunkCoord}");
+            // Mark as generating
+            if (chunkStates.TryGetValue(chunkCoord, out ChunkState state))
+            {
+                state.isGenerating = true;
+                chunkStates[chunkCoord] = state;
+            }
             
             // Set parameters
             terrainGenerationShader.SetTexture(generateTerrainKernel, "WorldData", worldDataTexture);
@@ -389,49 +538,145 @@ namespace GPUTerrain
             {
                 generationSettings.ApplyToComputeShader(terrainGenerationShader, generateTerrainKernel);
             }
-            else
-            {
-                // Use simple default values for testing
-                terrainGenerationShader.SetFloat("CaveFrequency", 0.02f);
-                terrainGenerationShader.SetFloat("CaveAmplitude", 1.0f);
-                terrainGenerationShader.SetInt("Octaves", 4);
-                terrainGenerationShader.SetFloat("Lacunarity", 2.0f);
-                terrainGenerationShader.SetFloat("Persistence", 0.5f);
-                terrainGenerationShader.SetFloat("MinCaveHeight", -50f);
-                terrainGenerationShader.SetFloat("MaxCaveHeight", 100f);
-            }
             
             // Dispatch
             int threadGroups = Mathf.CeilToInt(CHUNK_SIZE / 8.0f);
             terrainGenerationShader.Dispatch(generateTerrainKernel, threadGroups, threadGroups, threadGroups);
             
             // Update state
-            if (chunkStates.ContainsKey(chunkCoord))
+            if (chunkStates.TryGetValue(chunkCoord, out state))
             {
-                var state = chunkStates[chunkCoord];
                 state.isGenerated = true;
+                state.isGenerating = false;
                 chunkStates[chunkCoord] = state;
-                Debug.Log($"Chunk {chunkCoord} marked as generated");
+                totalChunksGenerated++;
+                
+                OnChunkGenerated?.Invoke(chunkCoord);
             }
         }
         
         void ExtractChunkMesh(int3 chunkCoord)
         {
-            // TODO: Implement mesh extraction
-            if (chunkStates.ContainsKey(chunkCoord))
+            // Mesh extraction is handled by ChunkMeshBuilder component
+            // This method is here for future GPU-only implementation
+        }
+        
+        void ModifyTerrain(float3 worldPos, float radius, float strength)
+        {
+            if (worldUpdateShader == null || updateWorldKernel < 0)
             {
-                var state = chunkStates[chunkCoord];
-                state.hasMesh = true;
+                Debug.LogWarning("Terrain modification not available - update shader missing");
+                return;
+            }
+            
+            // Find affected chunks
+            int3 minChunk = WorldToChunkCoord(worldPos - radius);
+            int3 maxChunk = WorldToChunkCoord(worldPos + radius);
+            
+            // Queue affected chunks for regeneration
+            for (int y = minChunk.y; y <= maxChunk.y; y++)
+            {
+                for (int z = minChunk.z; z <= maxChunk.z; z++)
+                {
+                    for (int x = minChunk.x; x <= maxChunk.x; x++)
+                    {
+                        int3 coord = new int3(x, y, z);
+                        if (IsChunkInBounds(coord))
+                        {
+                            QueueChunkRegeneration(coord);
+                        }
+                    }
+                }
+            }
+            
+            // Apply modification
+            worldUpdateShader.SetTexture(updateWorldKernel, "WorldData", worldDataTexture);
+            worldUpdateShader.SetVector("ModifyCenter", new Vector4(worldPos.x, worldPos.y, worldPos.z, 0));
+            worldUpdateShader.SetFloat("ModifyRadius", radius);
+            worldUpdateShader.SetFloat("ModifyStrength", strength);
+            
+            int groups = Mathf.CeilToInt((radius * 2) / voxelSize / 8);
+            worldUpdateShader.Dispatch(updateWorldKernel, groups, groups, groups);
+        }
+        
+        void RegenerateChunk(int3 chunkCoord)
+        {
+            if (chunkStates.TryGetValue(chunkCoord, out ChunkState state))
+            {
+                state.hasMesh = false;
                 chunkStates[chunkCoord] = state;
+                
+                // Notify mesh builder to rebuild
+                var meshBuilder = GetComponent<ChunkMeshBuilder>();
+                if (meshBuilder != null)
+                {
+                    meshBuilder.ClearChunk(chunkCoord);
+                }
             }
         }
         
-        void ModifyTerrain(float3 worldPos, float radius)
+        void CleanupDistantChunks()
         {
-            // TODO: Implement terrain modification
+            if (playerTransform == null && mainCamera == null) return;
+            
+            float3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
+            int3 viewerChunk = WorldToChunkCoord(viewerPos);
+            float maxDistance = viewDistance * 1.5f;
+            
+            List<int3> chunksToClean = new List<int3>();
+            
+            foreach (var kvp in chunkStates)
+            {
+                if (kvp.Value.hasMesh)
+                {
+                    float3 chunkOffset = new float3(kvp.Key - viewerChunk);
+                    float distance = math.length(chunkOffset);
+                    
+                    if (distance > maxDistance)
+                    {
+                        chunksToClean.Add(kvp.Key);
+                    }
+                }
+            }
+            
+            // Clean up distant chunks
+            var meshBuilder = GetComponent<ChunkMeshBuilder>();
+            foreach (var coord in chunksToClean)
+            {
+                if (meshBuilder != null)
+                {
+                    meshBuilder.ClearChunk(coord);
+                }
+                
+                if (chunkStates.TryGetValue(coord, out ChunkState state))
+                {
+                    state.hasMesh = false;
+                    state.isGenerated = false;
+                    chunkStates[coord] = state;
+                    totalChunksWithMesh--;
+                }
+            }
+            
+            if (chunksToClean.Count > 0)
+            {
+                Debug.Log($"Cleaned up {chunksToClean.Count} distant chunks");
+            }
         }
         
-        int3 WorldToChunkCoord(float3 worldPos)
+        void UpdateChunkLODs()
+        {
+            // TODO: Implement LOD system
+            // For now, all chunks use LOD 0
+        }
+        
+        bool IsChunkInBounds(int3 coord)
+        {
+            return coord.x >= 0 && coord.x < worldSizeChunks &&
+                   coord.y >= 0 && coord.y < worldHeightChunks &&
+                   coord.z >= 0 && coord.z < worldSizeChunks;
+        }
+        
+        public int3 WorldToChunkCoord(float3 worldPos)
         {
             return new int3(
                 Mathf.FloorToInt(worldPos.x / (CHUNK_SIZE * voxelSize)),
@@ -440,21 +685,58 @@ namespace GPUTerrain
             );
         }
         
+        public float3 ChunkToWorldPos(int3 chunkCoord)
+        {
+            return new float3(chunkCoord) * CHUNK_SIZE * voxelSize;
+        }
+        
         void QueueChunkGeneration(int3 coord)
         {
-            updateQueue.Enqueue(new ChunkUpdateCommand
+            if (!chunksInQueue.Contains(coord))
             {
-                type = ChunkUpdateCommand.CommandType.Generate,
-                chunkCoord = coord
-            });
+                updateQueue.Enqueue(new ChunkUpdateCommand
+                {
+                    type = ChunkUpdateCommand.CommandType.Generate,
+                    chunkCoord = coord
+                });
+                chunksInQueue.Add(coord);
+            }
         }
         
         void QueueMeshExtraction(int3 coord)
         {
+            if (!chunksInQueue.Contains(coord))
+            {
+                updateQueue.Enqueue(new ChunkUpdateCommand
+                {
+                    type = ChunkUpdateCommand.CommandType.Extract,
+                    chunkCoord = coord
+                });
+                chunksInQueue.Add(coord);
+            }
+        }
+        
+        void QueueChunkRegeneration(int3 coord)
+        {
+            if (!chunksInQueue.Contains(coord))
+            {
+                updateQueue.Enqueue(new ChunkUpdateCommand
+                {
+                    type = ChunkUpdateCommand.CommandType.Regenerate,
+                    chunkCoord = coord
+                });
+                chunksInQueue.Add(coord);
+            }
+        }
+        
+        public void ModifyTerrainAt(Vector3 worldPos, float radius, float strength = 1f)
+        {
             updateQueue.Enqueue(new ChunkUpdateCommand
             {
-                type = ChunkUpdateCommand.CommandType.Extract,
-                chunkCoord = coord
+                type = ChunkUpdateCommand.CommandType.Modify,
+                modifyCenter = worldPos,
+                modifyRadius = radius,
+                modifyStrength = strength
             });
         }
         
@@ -462,8 +744,53 @@ namespace GPUTerrain
         {
             StopAllCoroutines();
             updateQueue.Clear();
+            chunksInQueue.Clear();
             InitializeWorld();
             StartCoroutine(WorldUpdateLoop());
+            StartCoroutine(ChunkMaintenanceLoop());
+        }
+        
+        public void MarkChunkHasMesh(int3 coord)
+        {
+            if (chunkStates.ContainsKey(coord))
+            {
+                var state = chunkStates[coord];
+                if (!state.hasMesh)
+                {
+                    state.hasMesh = true;
+                    chunkStates[coord] = state;
+                    totalChunksWithMesh++;
+                    
+                    OnChunkMeshBuilt?.Invoke(coord);
+                }
+            }
+        }
+        
+        public ChunkState GetChunkState(int3 coord)
+        {
+            return chunkStates.TryGetValue(coord, out ChunkState state) ? state : default;
+        }
+        
+        public bool IsChunkGenerated(int3 coord)
+        {
+            return chunkStates.TryGetValue(coord, out ChunkState state) && state.isGenerated;
+        }
+        
+        public bool IsChunkVisible(int3 coord)
+        {
+            if (!chunkStates.TryGetValue(coord, out ChunkState state))
+                return false;
+                
+            if (playerTransform == null && mainCamera == null)
+                return false;
+                
+            float3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
+            int3 viewerChunk = WorldToChunkCoord(viewerPos);
+            
+            float3 chunkOffset = new float3(coord - viewerChunk);
+            float distance = math.length(chunkOffset);
+            
+            return distance <= viewDistance;
         }
         
         void OnDestroy()
@@ -475,6 +802,9 @@ namespace GPUTerrain
             indexPoolBuffer?.Release();
             drawArgsBuffer?.Release();
             visibleChunksBuffer?.Release();
+            updateCommandBuffer?.Release();
+            
+            Debug.Log($"Terrain system shutdown - Generated {totalChunksGenerated} chunks total");
         }
         
         void OnDrawGizmosSelected()
@@ -488,7 +818,47 @@ namespace GPUTerrain
                 Vector3 center = new Vector3(worldSize * 0.5f, worldHeight * 0.5f, worldSize * 0.5f);
                 Vector3 size = new Vector3(worldSize, worldHeight, worldSize);
                 Gizmos.DrawWireCube(center, size);
+                
+                // Draw view distance
+                if (playerTransform != null || mainCamera != null)
+                {
+                    Vector3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
+                    Gizmos.color = Color.cyan;
+                    Gizmos.DrawWireCube(viewerPos, Vector3.one * viewDistance * CHUNK_SIZE * voxelSize * 2);
+                }
             }
+        }
+        
+        // Debug methods
+        public void LogStatistics()
+        {
+            Debug.Log($"=== Terrain Statistics ===");
+            Debug.Log($"Total chunks: {chunkStates.Count}");
+            Debug.Log($"Generated chunks: {totalChunksGenerated}");
+            Debug.Log($"Chunks with mesh: {totalChunksWithMesh}");
+            Debug.Log($"Update queue size: {updateQueue.Count}");
+            Debug.Log($"GPU Memory estimate: {EstimateGPUMemoryUsage():F1} MB");
+        }
+        
+        float EstimateGPUMemoryUsage()
+        {
+            float totalMB = 0;
+            
+            // World texture
+            if (worldDataTexture != null)
+            {
+                int texSize = worldSizeChunks * CHUNK_SIZE;
+                int texHeight = worldHeightChunks * CHUNK_SIZE;
+                totalMB += (texSize * texHeight * texSize * 16) / (1024f * 1024f);
+            }
+            
+            // Buffers
+            if (vertexPoolBuffer != null)
+            {
+                totalMB += (MAX_VERTICES_PER_CHUNK * MAX_CHUNKS * TerrainVertex.Size) / (1024f * 1024f);
+            }
+            
+            return totalMB;
         }
     }
 }
