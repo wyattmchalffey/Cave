@@ -210,10 +210,6 @@ namespace GPUTerrain
         {
             try
             {
-                // Debug: Check struct size
-                int actualSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(ChunkMetadata));
-                Debug.Log($"ChunkMetadata actual size: {actualSize} bytes, expected: {ChunkMetadata.Size} bytes");
-                
                 // Create 3D world data texture
                 int texSize = worldSizeChunks * CHUNK_SIZE;
                 int texHeight = worldHeightChunks * CHUNK_SIZE;
@@ -268,11 +264,6 @@ namespace GPUTerrain
                 // Update command buffer
                 updateCommandBuffer = new ComputeBuffer(64, WorldUpdateCommand.Size);
                 
-                Debug.Log($"GPU resources initialized successfully:");
-                Debug.Log($"  World texture: {texSize}x{texHeight}x{texSize} ({(texSize * texHeight * texSize * 16) / (1024f * 1024f):F1} MB)");
-                Debug.Log($"  Total chunks capacity: {totalChunks}");
-                Debug.Log($"  Vertex pool: {totalVertices} vertices ({(totalVertices * TerrainVertex.Size) / (1024f * 1024f):F1} MB)");
-                
                 return true;
             }
             catch (System.Exception e)
@@ -293,7 +284,6 @@ namespace GPUTerrain
                 {
                     generateTerrainKernel = terrainGenerationShader.FindKernel("GenerateTerrain");
                     clearWorldKernel = terrainGenerationShader.FindKernel("ClearWorld");
-                    Debug.Log($"Found terrain kernels: Generate={generateTerrainKernel}, Clear={clearWorldKernel}");
                 }
                 catch (System.Exception e)
                 {
@@ -313,7 +303,6 @@ namespace GPUTerrain
                 try
                 {
                     extractMeshKernel = meshExtractionShader.FindKernel("ExtractMesh");
-                    Debug.Log($"Found mesh extraction kernel: {extractMeshKernel}");
                 }
                 catch (System.Exception e)
                 {
@@ -328,12 +317,10 @@ namespace GPUTerrain
                 try 
                 { 
                     updateWorldKernel = worldUpdateShader.FindKernel("UpdateWorld");
-                    Debug.Log($"Found world update kernel: {updateWorldKernel}");
                 }
                 catch 
                 { 
                     updateWorldKernel = -1;
-                    Debug.LogWarning("World update kernel not found - terrain modification disabled");
                 }
             }
             
@@ -342,12 +329,10 @@ namespace GPUTerrain
                 try 
                 { 
                     frustumCullKernel = frustumCullingShader.FindKernel("FrustumCull");
-                    Debug.Log($"Found frustum culling kernel: {frustumCullKernel}");
                 }
                 catch 
                 { 
                     frustumCullKernel = -1;
-                    Debug.LogWarning("Frustum culling kernel not found - GPU culling disabled");
                 }
             }
             
@@ -359,8 +344,6 @@ namespace GPUTerrain
             // Clear world data
             if (terrainGenerationShader != null && clearWorldKernel >= 0)
             {
-                Debug.Log("Clearing world data...");
-                
                 terrainGenerationShader.SetTexture(clearWorldKernel, "WorldData", worldDataTexture);
                 
                 int texSize = worldSizeChunks * CHUNK_SIZE;
@@ -369,8 +352,6 @@ namespace GPUTerrain
                 int threadGroupsY = Mathf.CeilToInt(texHeight / 8.0f);
                 
                 terrainGenerationShader.Dispatch(clearWorldKernel, threadGroups, threadGroupsY, threadGroups);
-                
-                Debug.Log("World data cleared");
             }
             
             // Initialize chunk states
@@ -400,24 +381,14 @@ namespace GPUTerrain
                     }
                 }
             }
-            
-            Debug.Log($"World initialized with {chunkStates.Count} chunks");
         }
         
         IEnumerator WorldUpdateLoop()
         {
             while (true)
             {
-                float startTime = Time.realtimeSinceStartup;
-                
                 ProcessUpdateQueue();
                 UpdateVisibleChunks();
-                
-                float elapsed = Time.realtimeSinceStartup - startTime;
-                if (elapsed > 0.016f) // More than 16ms
-                {
-                    Debug.LogWarning($"World update took {elapsed * 1000:F1}ms");
-                }
                 
                 yield return new WaitForSeconds(updateInterval);
             }
@@ -429,7 +400,6 @@ namespace GPUTerrain
             
             while (true)
             {
-                // Periodic maintenance tasks
                 CleanupDistantChunks();
                 UpdateChunkLODs();
                 
@@ -516,7 +486,6 @@ namespace GPUTerrain
         {
             if (terrainGenerationShader == null || generateTerrainKernel < 0)
             {
-                Debug.LogError($"Cannot generate chunk {chunkCoord}: Shader not ready");
                 return;
             }
             
@@ -565,7 +534,6 @@ namespace GPUTerrain
         {
             if (worldUpdateShader == null || updateWorldKernel < 0)
             {
-                Debug.LogWarning("Terrain modification not available - update shader missing");
                 return;
             }
             
@@ -655,11 +623,6 @@ namespace GPUTerrain
                     chunkStates[coord] = state;
                     totalChunksWithMesh--;
                 }
-            }
-            
-            if (chunksToClean.Count > 0)
-            {
-                Debug.Log($"Cleaned up {chunksToClean.Count} distant chunks");
             }
         }
         
@@ -803,8 +766,6 @@ namespace GPUTerrain
             drawArgsBuffer?.Release();
             visibleChunksBuffer?.Release();
             updateCommandBuffer?.Release();
-            
-            Debug.Log($"Terrain system shutdown - Generated {totalChunksGenerated} chunks total");
         }
         
         void OnDrawGizmosSelected()

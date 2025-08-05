@@ -57,8 +57,6 @@ namespace GPUTerrain
             
             // Args buffer for indirect drawing (optional)
             argsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
-            
-            Debug.Log("ChunkMeshBuilder initialized with append buffers");
         }
         
         public void SetWorldDataTexture(RenderTexture texture)
@@ -104,7 +102,6 @@ namespace GPUTerrain
         {
             if (meshExtractionShader == null || worldDataTexture == null)
             {
-                Debug.LogError("Missing resources for mesh extraction!");
                 yield break;
             }
             
@@ -122,7 +119,6 @@ namespace GPUTerrain
             
             if (kernel < 0)
             {
-                Debug.LogError("Invalid kernel index for ExtractMesh");
                 yield break;
             }
             
@@ -157,8 +153,6 @@ namespace GPUTerrain
             argsBuffer.GetData(args);
             int vertexCount = (int)args[0];
             
-            Debug.Log($"Chunk {chunkCoord}: Generated {vertexCount} vertices");
-            
             if (vertexCount > 0 && vertexCount < maxVerticesPerChunk)
             {
                 // Read back data
@@ -176,7 +170,6 @@ namespace GPUTerrain
                 
                 if (vertexRequest.hasError || normalRequest.hasError || indexRequest.hasError)
                 {
-                    Debug.LogError($"GPU readback failed for chunk {chunkCoord}");
                     yield break;
                 }
                 
@@ -225,18 +218,11 @@ namespace GPUTerrain
                 
                 // Update chunk state
                 worldManager.MarkChunkHasMesh(chunkCoord);
-                
-                Debug.Log($"Built mesh for chunk {chunkCoord} with {vertexCount} vertices, {vertexCount/3} triangles");
             }
             else if (vertexCount == 0)
             {
                 // Empty chunk - still mark as having mesh to avoid reprocessing
                 worldManager.MarkChunkHasMesh(chunkCoord);
-                Debug.Log($"Chunk {chunkCoord} is empty");
-            }
-            else
-            {
-                Debug.LogWarning($"Chunk {chunkCoord} has too many vertices: {vertexCount}");
             }
         }
         
