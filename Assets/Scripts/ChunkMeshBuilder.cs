@@ -1,4 +1,4 @@
-// ChunkMeshBuilder.cs - Builds Unity meshes from GPU-extracted data
+// ChunkMeshBuilder.cs - Fixed version that properly reads GPU data
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -15,13 +15,13 @@ namespace GPUTerrain
         
         [Header("Settings")]
         [SerializeField] private int maxVerticesPerChunk = 15000;
+        [SerializeField] private bool debugLogging = false;
         
         // Buffers for mesh extraction
         private ComputeBuffer vertexBuffer;
         private ComputeBuffer normalBuffer;
         private ComputeBuffer indexBuffer;
         private ComputeBuffer counterBuffer;
-        private ComputeBuffer argsBuffer;
         
         // Mesh pool
         private Queue<GameObject> meshPool = new Queue<GameObject>();
@@ -30,6 +30,10 @@ namespace GPUTerrain
         // References
         private TerrainWorldManager worldManager;
         private RenderTexture worldDataTexture;
+        
+        // Stats
+        private int totalMeshesCreated = 0;
+        private int emptyChunksSkipped = 0;
         
         void Start()
         {
@@ -47,26 +51,28 @@ namespace GPUTerrain
         
         void InitializeBuffers()
         {
-            // Create buffers for mesh extraction - using append buffers
-            vertexBuffer = new ComputeBuffer(maxVerticesPerChunk, sizeof(float) * 3, ComputeBufferType.Append);
-            normalBuffer = new ComputeBuffer(maxVerticesPerChunk, sizeof(float) * 3, ComputeBufferType.Append);
-            indexBuffer = new ComputeBuffer(maxVerticesPerChunk * 3, sizeof(uint), ComputeBufferType.Append);
+            // Create buffers for mesh extraction - using structured buffers for better control
+            vertexBuffer = new ComputeBuffer(maxVerticesPerChunk, sizeof(float) * 3);
+            normalBuffer = new ComputeBuffer(maxVerticesPerChunk, sizeof(float) * 3);
+            indexBuffer = new ComputeBuffer(maxVerticesPerChunk * 3, sizeof(uint));
             
             // Counter buffer to track how many vertices were generated
             counterBuffer = new ComputeBuffer(1, sizeof(uint), ComputeBufferType.Raw);
             
-            // Args buffer for indirect drawing (optional)
-            argsBuffer = new ComputeBuffer(4, sizeof(uint), ComputeBufferType.IndirectArguments);
+            Debug.Log("ChunkMeshBuilder initialized buffers");
         }
         
         public void SetWorldDataTexture(RenderTexture texture)
         {
             worldDataTexture = texture;
+            Debug.Log($"World data texture set: {texture?.width}x{texture?.height}x{texture?.volumeDepth}");
         }
         
         IEnumerator MeshBuildingLoop()
         {
             yield return new WaitForSeconds(1f); // Wait for world to initialize
+            
+            Debug.Log("ChunkMeshBuilder starting mesh building loop");
             
             while (true)
             {
@@ -83,13 +89,20 @@ namespace GPUTerrain
                     
                     if (state.isGenerated && !state.hasMesh && !activeChunks.ContainsKey(coord))
                     {
-                        chunksToProcess.Add(coord);
+                        // Additional check - only process chunks that are visible
+                        if (worldManager.IsChunkVisible(coord))
+                        {
+                            chunksToProcess.Add(coord);
+                        }
                     }
                 }
                 
                 // Process the chunks
                 foreach (var coord in chunksToProcess)
                 {
+                    if (debugLogging)
+                        Debug.Log($"Building mesh for chunk {coord}");
+                        
                     yield return StartCoroutine(BuildChunkMesh(coord));
                     yield return null; // Spread work across frames
                 }
@@ -102,6 +115,7 @@ namespace GPUTerrain
         {
             if (meshExtractionShader == null || worldDataTexture == null)
             {
+                Debug.LogError($"Cannot build mesh - shader or texture is null");
                 yield break;
             }
             
@@ -117,15 +131,7 @@ namespace GPUTerrain
                 yield break;
             }
             
-            if (kernel < 0)
-            {
-                yield break;
-            }
-            
             // Reset buffers
-            vertexBuffer.SetCounterValue(0);
-            normalBuffer.SetCounterValue(0);
-            indexBuffer.SetCounterValue(0);
             counterBuffer.SetData(new uint[] { 0 });
             
             // Set parameters
@@ -134,63 +140,56 @@ namespace GPUTerrain
             meshExtractionShader.SetFloat("VoxelSize", worldManager.VoxelSize);
             meshExtractionShader.SetInt("ChunkSize", TerrainWorldManager.CHUNK_SIZE);
             
-            // Set buffers - these must match the names in the compute shader
+            // Set buffers
             meshExtractionShader.SetBuffer(kernel, "Vertices", vertexBuffer);
             meshExtractionShader.SetBuffer(kernel, "Normals", normalBuffer);
             meshExtractionShader.SetBuffer(kernel, "Indices", indexBuffer);
             meshExtractionShader.SetBuffer(kernel, "VertexCount", counterBuffer);
             
             // Dispatch
-            int threadGroups = Mathf.CeilToInt(TerrainWorldManager.CHUNK_SIZE / 4.0f); // Match the [4,4,4] thread group size
+            int threadGroups = Mathf.CeilToInt(TerrainWorldManager.CHUNK_SIZE / 4.0f);
             meshExtractionShader.Dispatch(kernel, threadGroups, threadGroups, threadGroups);
             
             // Wait a frame for GPU to finish
             yield return null;
             
-            // Get the actual vertex count from the append buffer
-            ComputeBuffer.CopyCount(vertexBuffer, argsBuffer, 0);
-            uint[] args = new uint[4];
-            argsBuffer.GetData(args);
-            int vertexCount = (int)args[0];
+            // Get the actual vertex count
+            uint[] countData = new uint[1];
+            counterBuffer.GetData(countData);
+            int vertexCount = (int)countData[0];
+            int indexCount = vertexCount; // Since we're writing indices directly
             
-            if (vertexCount > 0 && vertexCount < maxVerticesPerChunk)
+            if (debugLogging)
+                Debug.Log($"Chunk {chunkCoord}: {vertexCount} vertices, {indexCount} indices");
+            
+            if (vertexCount > 0 && vertexCount < maxVerticesPerChunk && indexCount > 0)
             {
-                // Read back data
+                // Read back data using regular GetData for now (AsyncGPUReadback can be tricky with append buffers)
                 Vector3[] vertices = new Vector3[vertexCount];
                 Vector3[] normals = new Vector3[vertexCount];
-                int[] indices = new int[vertexCount];
+                uint[] indices = new uint[indexCount];
                 
-                // Create native arrays for async readback (more efficient)
-                var vertexRequest = AsyncGPUReadback.Request(vertexBuffer, vertexCount * sizeof(float) * 3, 0);
-                var normalRequest = AsyncGPUReadback.Request(normalBuffer, vertexCount * sizeof(float) * 3, 0);
-                var indexRequest = AsyncGPUReadback.Request(indexBuffer, vertexCount * sizeof(uint), 0);
-                
-                // Wait for readback to complete
-                yield return new WaitUntil(() => vertexRequest.done && normalRequest.done && indexRequest.done);
-                
-                if (vertexRequest.hasError || normalRequest.hasError || indexRequest.hasError)
-                {
-                    yield break;
-                }
-                
-                // Get data from readback
-                var vertexData = vertexRequest.GetData<Vector3>();
-                var normalData = normalRequest.GetData<Vector3>();
-                var indexData = indexRequest.GetData<uint>();
-                
-                vertexData.CopyTo(vertices);
-                normalData.CopyTo(normals);
+                // Get data directly
+                vertexBuffer.GetData(vertices, 0, 0, vertexCount);
+                normalBuffer.GetData(normals, 0, 0, vertexCount);
+                indexBuffer.GetData(indices, 0, 0, indexCount);
                 
                 // Convert uint indices to int
-                indices = new int[vertexCount];
-                for (int i = 0; i < vertexCount; i++)
+                int[] intIndices = new int[indexCount];
+                for (int i = 0; i < indexCount; i++)
                 {
-                    indices[i] = (int)indexData[i];
+                    intIndices[i] = (int)indices[i];
                 }
                 
                 // Create mesh
                 GameObject chunkObj = GetOrCreateChunkObject(chunkCoord);
                 MeshFilter meshFilter = chunkObj.GetComponent<MeshFilter>();
+                
+                // Destroy old mesh if it exists
+                if (meshFilter.mesh != null)
+                {
+                    DestroyImmediate(meshFilter.mesh);
+                }
                 
                 Mesh mesh = new Mesh();
                 mesh.name = $"Chunk_{chunkCoord}";
@@ -202,7 +201,7 @@ namespace GPUTerrain
                 
                 mesh.vertices = vertices;
                 mesh.normals = normals;
-                mesh.triangles = indices;
+                mesh.triangles = intIndices;
                 
                 // Calculate bounds
                 mesh.RecalculateBounds();
@@ -213,16 +212,32 @@ namespace GPUTerrain
                 // Assign mesh
                 meshFilter.mesh = mesh;
                 
+                // Make sure the chunk is active
+                chunkObj.SetActive(true);
+                
                 // Store reference
                 activeChunks[chunkCoord] = chunkObj;
                 
                 // Update chunk state
                 worldManager.MarkChunkHasMesh(chunkCoord);
+                
+                totalMeshesCreated++;
+                
+                if (debugLogging)
+                    Debug.Log($"Created mesh for chunk {chunkCoord} with {vertexCount} vertices");
             }
             else if (vertexCount == 0)
             {
                 // Empty chunk - still mark as having mesh to avoid reprocessing
                 worldManager.MarkChunkHasMesh(chunkCoord);
+                emptyChunksSkipped++;
+                
+                if (debugLogging)
+                    Debug.Log($"Chunk {chunkCoord} is empty, skipping");
+            }
+            else
+            {
+                Debug.LogWarning($"Chunk {chunkCoord} has invalid vertex count: {vertexCount} or index count: {indexCount}");
             }
         }
         
@@ -274,6 +289,20 @@ namespace GPUTerrain
             }
         }
         
+        public void EnableDebugLogging(bool enable)
+        {
+            debugLogging = enable;
+        }
+        
+        public void LogStats()
+        {
+            Debug.Log($"ChunkMeshBuilder Stats:");
+            Debug.Log($"  Total meshes created: {totalMeshesCreated}");
+            Debug.Log($"  Empty chunks skipped: {emptyChunksSkipped}");
+            Debug.Log($"  Active chunks: {activeChunks.Count}");
+            Debug.Log($"  Pooled chunks: {meshPool.Count}");
+        }
+        
         void OnDestroy()
         {
             // Clean up all meshes
@@ -284,6 +313,13 @@ namespace GPUTerrain
                 {
                     DestroyImmediate(meshFilter.mesh);
                 }
+                Destroy(chunk);
+            }
+            
+            while (meshPool.Count > 0)
+            {
+                var chunk = meshPool.Dequeue();
+                Destroy(chunk);
             }
             
             // Release buffers
@@ -291,7 +327,6 @@ namespace GPUTerrain
             normalBuffer?.Release();
             indexBuffer?.Release();
             counterBuffer?.Release();
-            argsBuffer?.Release();
         }
         
         void OnDrawGizmosSelected()

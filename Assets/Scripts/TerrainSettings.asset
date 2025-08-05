@@ -17,8 +17,8 @@ MonoBehaviour:
   octaves: 4
   lacunarity: 2
   persistence: 0.5
-  minCaveHeight: -50
-  maxCaveHeight: 100
+  minCaveHeight: -1000
+  maxCaveHeight: 1000
   chamberProbability: 0.1
   minChamberRadius: 10
   maxChamberRadius: 30

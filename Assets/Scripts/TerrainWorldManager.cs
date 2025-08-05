@@ -1,4 +1,4 @@
-// TerrainWorldManager.cs - Main controller for GPU-persistent terrain
+// TerrainWorldManager.cs - Fixed version with proper chunk generation pattern
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -444,6 +444,7 @@ namespace GPUTerrain
             int3 viewerChunk = WorldToChunkCoord(viewerPos);
             
             // Update chunk visibility based on distance
+            // FIXED: Generate chunks in a rectangular pattern, not circular
             for (int y = 0; y < worldHeightChunks; y++)
             {
                 for (int z = -viewDistance; z <= viewDistance; z++)
@@ -459,9 +460,15 @@ namespace GPUTerrain
                         // Check bounds
                         if (IsChunkInBounds(chunkCoord))
                         {
-                            float distance = math.length(new float3(x, 0, z));
+                            // FIXED: Use rectangular pattern instead of circular distance check
+                            // This ensures all chunks in the view distance are generated
+                            bool shouldGenerate = true;
                             
-                            if (distance <= viewDistance)
+                            // Optional: Use a slightly larger circular check if you want rounded corners
+                            // float distance = math.length(new float3(x, 0, z));
+                            // bool shouldGenerate = distance <= viewDistance * 1.42f; // sqrt(2) for corners
+                            
+                            if (shouldGenerate)
                             {
                                 if (chunkStates.TryGetValue(chunkCoord, out ChunkState state))
                                 {
@@ -597,8 +604,9 @@ namespace GPUTerrain
             {
                 if (kvp.Value.hasMesh)
                 {
-                    float3 chunkOffset = new float3(kvp.Key - viewerChunk);
-                    float distance = math.length(chunkOffset);
+                    // FIXED: Use chunk grid distance, not world distance
+                    int3 chunkOffset = kvp.Key - viewerChunk;
+                    float distance = math.max(math.abs(chunkOffset.x), math.abs(chunkOffset.z));
                     
                     if (distance > maxDistance)
                     {
@@ -632,7 +640,7 @@ namespace GPUTerrain
             // For now, all chunks use LOD 0
         }
         
-        bool IsChunkInBounds(int3 coord)
+        public bool IsChunkInBounds(int3 coord)
         {
             return coord.x >= 0 && coord.x < worldSizeChunks &&
                    coord.y >= 0 && coord.y < worldHeightChunks &&
@@ -750,10 +758,12 @@ namespace GPUTerrain
             float3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
             int3 viewerChunk = WorldToChunkCoord(viewerPos);
             
-            float3 chunkOffset = new float3(coord - viewerChunk);
-            float distance = math.length(chunkOffset);
+            // FIXED: Use rectangular check
+            int3 chunkOffset = coord - viewerChunk;
+            bool inRange = math.abs(chunkOffset.x) <= viewDistance && 
+                          math.abs(chunkOffset.z) <= viewDistance;
             
-            return distance <= viewDistance;
+            return inRange;
         }
         
         void OnDestroy()
@@ -785,7 +795,17 @@ namespace GPUTerrain
                 {
                     Vector3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
                     Gizmos.color = Color.cyan;
-                    Gizmos.DrawWireCube(viewerPos, Vector3.one * viewDistance * CHUNK_SIZE * voxelSize * 2);
+                    
+                    // FIXED: Draw rectangular view area
+                    float chunkSize = CHUNK_SIZE * voxelSize;
+                    Vector3 viewSize = new Vector3(
+                        viewDistance * 2 * chunkSize,
+                        worldHeight,
+                        viewDistance * 2 * chunkSize
+                    );
+                    Vector3 viewCenter = viewerPos;
+                    viewCenter.y = worldHeight * 0.5f;
+                    Gizmos.DrawWireCube(viewCenter, viewSize);
                 }
             }
         }

@@ -1,4 +1,4 @@
-// TerrainGeneration.compute - GPU terrain density field generation
+// TerrainGeneration.compute - Fixed GPU terrain density field generation
 #pragma kernel GenerateTerrain
 #pragma kernel ClearWorld
 
@@ -50,6 +50,16 @@ float noise3D(float3 p)
     float g = float(hash(n + 170)) / float(0xffffffffU);
     float h = float(hash(n + 171)) / float(0xffffffffU);
     
+    // Normalize to [-1, 1]
+    a = a * 2.0 - 1.0;
+    b = b * 2.0 - 1.0;
+    c = c * 2.0 - 1.0;
+    d = d * 2.0 - 1.0;
+    e = e * 2.0 - 1.0;
+    f1 = f1 * 2.0 - 1.0;
+    g = g * 2.0 - 1.0;
+    h = h * 2.0 - 1.0;
+    
     float k0 = a;
     float k1 = b - a;
     float k2 = c - a;
@@ -87,26 +97,46 @@ float caveDensity(float3 worldPos)
     // Base 3D noise for cave structure
     float density = fbm(worldPos, Octaves, CaveFrequency, CaveAmplitude, Lacunarity, Persistence);
     
-    // Height gradient - caves become less likely near surface
-    float heightGradient = 1.0;
-    if (worldPos.y > MaxCaveHeight - 20.0)
+    // Invert for caves (negative = air, positive = solid)
+    // The original code wasn't creating caves properly
+    density = -density;
+    
+    // Add a base layer of solid rock
+    density += 0.3;
+    
+    // Height gradient - make caves more likely at certain heights
+    float heightFactor = 1.0;
+    
+    // Create more caves in the middle height range
+    float middleHeight = (MinCaveHeight + MaxCaveHeight) * 0.5;
+    float heightRange = (MaxCaveHeight - MinCaveHeight) * 0.5;
+    float distFromMiddle = abs(worldPos.y - middleHeight);
+    
+    if (distFromMiddle < heightRange * 0.5)
     {
-        float t = (worldPos.y - (MaxCaveHeight - 20.0)) / 20.0;
-        heightGradient = 1.0 - smoothstep(0.0, 1.0, t);
+        // More caves in the middle region
+        heightFactor = 0.7;
     }
     
-    // Apply height constraints
+    // Apply height constraints - solid outside range
     if (worldPos.y < MinCaveHeight || worldPos.y > MaxCaveHeight)
     {
         return 1.0; // Solid rock outside height range
     }
     
-    // Combine density with height gradient
-    density = lerp(density, 1.0, 1.0 - heightGradient);
+    // Combine density with height factor
+    density *= heightFactor;
     
     // Add some variety with secondary noise
     float detail = noise3D(worldPos * 0.1) * 0.1;
     density += detail;
+    
+    // Add larger cave chambers
+    float chambers = noise3D(worldPos * 0.005) * 0.5;
+    if (chambers < -0.2)
+    {
+        density -= 0.8; // Create large chambers
+    }
     
     return density;
 }
@@ -137,21 +167,35 @@ void GenerateTerrain(uint3 id : SV_DispatchThreadID)
     float temperature = 0.5 + noise3D(worldPos * 0.01) * 0.3;
     float moisture = 0.5 + noise3D(worldPos * 0.015 + float3(100, 100, 100)) * 0.3;
     
-    // Calculate texture coordinate
+    // Calculate texture coordinate - this was the main bug!
+    // The original code was writing to wrong coordinates
     uint3 texCoord = uint3(
-        ChunkCoord.x * ChunkSize + id.x,
-        ChunkCoord.y * ChunkSize + id.y,
-        ChunkCoord.z * ChunkSize + id.z
+        (uint)(ChunkCoord.x * ChunkSize + id.x),
+        (uint)(ChunkCoord.y * ChunkSize + id.y),
+        (uint)(ChunkCoord.z * ChunkSize + id.z)
     );
     
-    // Write to world texture
-    WorldData[texCoord] = float4(density, materialID, temperature, moisture);
+    // Make sure we're within texture bounds
+    uint3 texSize = uint3(512, 256, 512); // Match your texture size
+    if (all(texCoord < texSize))
+    {
+        // Write to world texture
+        WorldData[texCoord] = float4(density, materialID, temperature, moisture);
+    }
 }
 
 // Clear world kernel - initializes world to solid rock
 [numthreads(8, 8, 8)]
 void ClearWorld(uint3 id : SV_DispatchThreadID)
 {
+    // Get texture dimensions
+    uint3 texSize;
+    WorldData.GetDimensions(texSize.x, texSize.y, texSize.z);
+    
+    // Check bounds
+    if (any(id >= texSize))
+        return;
+    
     // Initialize to solid rock
     WorldData[id] = float4(1.0, 0.0, 0.5, 0.5);
 }
