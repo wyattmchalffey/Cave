@@ -1,0 +1,123 @@
+// VoxelDebug.compute - Renders terrain as voxels for debugging
+#pragma kernel ExtractVoxels
+
+// World data
+Texture3D<float4> WorldData;
+
+// Output buffers
+RWStructuredBuffer<float3> VertexBuffer;
+RWStructuredBuffer<float3> NormalBuffer;
+RWStructuredBuffer<uint> IndexBuffer;
+RWStructuredBuffer<uint> VertexCounter;
+
+// Chunk info
+float4 ChunkCoord;
+float VoxelSize;
+int ChunkSize;
+float IsoLevel;
+
+// Voxel cube vertices (for a unit cube)
+static const float3 CubeVertices[8] = {
+    float3(0, 0, 0), float3(1, 0, 0), float3(1, 1, 0), float3(0, 1, 0),
+    float3(0, 0, 1), float3(1, 0, 1), float3(1, 1, 1), float3(0, 1, 1)
+};
+
+// Voxel cube faces (quads split into triangles)
+static const int CubeFaces[36] = {
+    // Front face
+    0, 2, 1, 0, 3, 2,
+    // Back face
+    5, 6, 4, 4, 6, 7,
+    // Top face
+    3, 7, 6, 3, 6, 2,
+    // Bottom face
+    4, 1, 5, 4, 0, 1,
+    // Right face
+    1, 6, 5, 1, 2, 6,
+    // Left face
+    4, 3, 0, 4, 7, 3
+};
+
+// Sample density at a specific voxel
+float SampleDensity(int3 voxelCoord)
+{
+    // Calculate texture coordinate
+    int3 chunkBase = int3(ChunkCoord.x, ChunkCoord.y, ChunkCoord.z);
+    int3 texCoord = chunkBase * ChunkSize + voxelCoord;
+    
+    // Get texture dimensions for bounds checking
+    uint3 texDims;
+    WorldData.GetDimensions(texDims.x, texDims.y, texDims.z);
+    
+    // Clamp to texture bounds
+    texCoord = clamp(texCoord, int3(0, 0, 0), int3(texDims) - 1);
+    
+    return WorldData[texCoord].x;
+}
+
+[numthreads(1, 1, 1)]
+void ExtractVoxels(uint3 id : SV_DispatchThreadID)
+{
+    // Reset counter
+    VertexCounter[0] = 0;
+    
+    // Calculate world offset for this chunk
+    int3 chunkBase = int3(ChunkCoord.x, ChunkCoord.y, ChunkCoord.z);
+    float3 worldOffset = float3(chunkBase) * ChunkSize * VoxelSize;
+    
+    uint vertexIndex = 0;
+    
+    // Process each voxel in the chunk
+    for (int z = 0; z < ChunkSize; z++)
+    {
+        for (int y = 0; y < ChunkSize; y++)
+        {
+            for (int x = 0; x < ChunkSize; x++)
+            {
+                int3 voxelCoord = int3(x, y, z);
+                float density = SampleDensity(voxelCoord);
+                
+                // Check if voxel is solid (density below iso level)
+                if (density < IsoLevel)
+                {
+                    // Calculate voxel world position
+                    float3 voxelWorldPos = float3(voxelCoord) * VoxelSize + worldOffset;
+                    
+                    // Get current vertex index
+                    uint baseIndex;
+                    InterlockedAdd(VertexCounter[0], 36, baseIndex); // 36 vertices per cube (6 faces * 6 vertices)
+                    
+                    // Safety check
+                    if (baseIndex + 36 >= 65535)
+                        return;
+                    
+                    // Generate cube faces
+                    for (int face = 0; face < 6; face++)
+                    {
+                        // Calculate normal for this face
+                        float3 normal = float3(0, 0, 0);
+                        if (face == 0) normal = float3(0, 0, -1); // Front
+                        else if (face == 1) normal = float3(0, 0, 1); // Back
+                        else if (face == 2) normal = float3(0, 1, 0); // Top
+                        else if (face == 3) normal = float3(0, -1, 0); // Bottom
+                        else if (face == 4) normal = float3(1, 0, 0); // Right
+                        else if (face == 5) normal = float3(-1, 0, 0); // Left
+                        
+                        // Add 6 vertices for this face (2 triangles)
+                        for (int v = 0; v < 6; v++)
+                        {
+                            int vertIndex = CubeFaces[face * 6 + v];
+                            float3 localPos = CubeVertices[vertIndex] * VoxelSize;
+                            float3 worldPos = voxelWorldPos + localPos;
+                            
+                            uint idx = baseIndex + face * 6 + v;
+                            VertexBuffer[idx] = worldPos;
+                            NormalBuffer[idx] = normal;
+                            IndexBuffer[idx] = idx;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
