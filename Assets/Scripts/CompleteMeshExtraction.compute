@@ -1,17 +1,15 @@
-// CompleteMeshExtraction.compute - Fixed marching cubes implementation
+// CompleteMeshExtraction.compute - Fixed for smooth mesh generation
 #pragma kernel ExtractMesh
 #pragma kernel CountVertices
 
 // World data
 Texture3D<float4> WorldData;
 
-// Output buffers - using structured buffers instead of append for better control
-RWStructuredBuffer<float3> Vertices;
-RWStructuredBuffer<float3> Normals;
-RWStructuredBuffer<uint> Indices;
-
-// Counter for vertex allocation
-RWStructuredBuffer<uint> VertexCount;
+// Output buffers - Note: Changed to use structured buffers for better control
+RWStructuredBuffer<float3> VertexBuffer;
+RWStructuredBuffer<float3> NormalBuffer;
+RWStructuredBuffer<uint> IndexBuffer;
+RWStructuredBuffer<uint> VertexCounter;
 
 // Chunk info
 float4 ChunkCoord;
@@ -21,7 +19,7 @@ int ChunkSize;
 // Constants
 static const float ISO_LEVEL = 0.0;
 
-// Marching cubes lookup tables (abbreviated for space - use full tables from MarchingCubesTables.cs)
+// Marching cubes lookup tables
 static const int EdgeTable[256] = {
     0x0, 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
     0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
@@ -57,7 +55,6 @@ static const int EdgeTable[256] = {
     0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0
 };
 
-// Include abbreviated TriTable - in production, use full table from MarchingCubesTables.cs
 static const int TriTable[256][16] =
 {
     { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
@@ -331,187 +328,265 @@ static const int2 EdgeConnections[12] = {
     int2(0, 4), int2(1, 5), int2(2, 6), int2(3, 7)
 };
 
-// Sample density from world texture
+// Helper function to sample at specific texture coordinate with bounds checking
+float SampleDensityAt(int3 coord, uint3 texDims)
+{
+    // Clamp to texture bounds
+    coord = clamp(coord, int3(0, 0, 0), int3(texDims) - 1);
+    return WorldData[coord].x;
+}
+
+// Manual trilinear interpolation for smooth sampling
+float SampleDensitySmooth(float3 worldPos)
+{
+    // Convert world position to voxel coordinates
+    int3 chunkBase = int3(ChunkCoord.x, ChunkCoord.y, ChunkCoord.z);
+    float3 voxelPos = worldPos / VoxelSize;
+    
+    // Get the base voxel coordinate and fractional part
+    float3 baseCoord = floor(voxelPos);
+    float3 frac = voxelPos - baseCoord;
+    
+    // Convert to texture coordinates
+    int3 texBase = int3(baseCoord);
+    
+    // Get texture dimensions for bounds checking
+    uint3 texDims;
+    WorldData.GetDimensions(texDims.x, texDims.y, texDims.z);
+    
+    // Sample 8 corners for trilinear interpolation
+    float v000 = SampleDensityAt(texBase + int3(0, 0, 0), texDims);
+    float v100 = SampleDensityAt(texBase + int3(1, 0, 0), texDims);
+    float v010 = SampleDensityAt(texBase + int3(0, 1, 0), texDims);
+    float v110 = SampleDensityAt(texBase + int3(1, 1, 0), texDims);
+    float v001 = SampleDensityAt(texBase + int3(0, 0, 1), texDims);
+    float v101 = SampleDensityAt(texBase + int3(1, 0, 1), texDims);
+    float v011 = SampleDensityAt(texBase + int3(0, 1, 1), texDims);
+    float v111 = SampleDensityAt(texBase + int3(1, 1, 1), texDims);
+    
+    // Trilinear interpolation
+    float x0 = lerp(v000, v100, frac.x);
+    float x1 = lerp(v010, v110, frac.x);
+    float x2 = lerp(v001, v101, frac.x);
+    float x3 = lerp(v011, v111, frac.x);
+    
+    float y0 = lerp(x0, x1, frac.y);
+    float y1 = lerp(x2, x3, frac.y);
+    
+    return lerp(y0, y1, frac.z);
+}
+
+// Sample density at integer coordinates
 float SampleDensity(int3 coord)
 {
-    int3 texCoord;
-    texCoord.x = (int)(ChunkCoord.x * ChunkSize) + coord.x;
-    texCoord.y = (int)(ChunkCoord.y * ChunkSize) + coord.y;
-    texCoord.z = (int)(ChunkCoord.z * ChunkSize) + coord.z;
+    int3 chunkBase = int3(ChunkCoord.x, ChunkCoord.y, ChunkCoord.z);
+    int3 texCoord = chunkBase * ChunkSize + coord;
     
-    // Clamp to texture bounds to avoid out of bounds access
-    uint3 texSize;
-    WorldData.GetDimensions(texSize.x, texSize.y, texSize.z);
-    texCoord = clamp(texCoord, int3(0, 0, 0), int3(texSize) - 1);
+    // Get texture dimensions
+    uint3 texDims;
+    WorldData.GetDimensions(texDims.x, texDims.y, texDims.z);
+    
+    // Clamp to bounds
+    texCoord = clamp(texCoord, int3(0, 0, 0), int3(texDims) - 1);
     
     return WorldData[texCoord].x;
 }
 
-// Vertex interpolation
+// Improved vertex interpolation
 float3 InterpolateVertex(float3 p1, float3 p2, float v1, float v2)
 {
-    if (abs(ISO_LEVEL - v1) < 0.00001)
+    // Handle edge case where densities are nearly equal
+    if (abs(v2 - v1) < 0.00001)
         return p1;
-    if (abs(ISO_LEVEL - v2) < 0.00001)
-        return p2;
-    if (abs(v1 - v2) < 0.00001)
-        return p1;
-        
-    float t = (ISO_LEVEL - v1) / (v2 - v1);
-    return lerp(p1, p2, saturate(t));
+    
+    // Calculate interpolation factor
+    float t = saturate((ISO_LEVEL - v1) / (v2 - v1));
+    
+    // Smooth the interpolation for better results
+    // Using smoothstep for smoother transitions
+    t = smoothstep(0.0, 1.0, t);
+    
+    return lerp(p1, p2, t);
 }
 
-// Calculate normal using gradient
-float3 CalculateNormal(float3 worldPos)
+// Calculate smooth normal using central differences
+float3 CalculateSmoothNormal(float3 worldPos)
 {
-    float h = VoxelSize;
+    float h = VoxelSize * 0.5; // Half voxel size for better gradient
     
-    // Convert world position back to grid coordinates
-    float3 chunkWorldPos = ChunkCoord.xyz * ChunkSize * VoxelSize;
-    int3 gridPos = int3((worldPos - chunkWorldPos) / VoxelSize);
+    // Sample density at neighboring points
+    float dx = SampleDensitySmooth(worldPos + float3(h, 0, 0)) - 
+               SampleDensitySmooth(worldPos - float3(h, 0, 0));
+    float dy = SampleDensitySmooth(worldPos + float3(0, h, 0)) - 
+               SampleDensitySmooth(worldPos - float3(0, h, 0));
+    float dz = SampleDensitySmooth(worldPos + float3(0, 0, h)) - 
+               SampleDensitySmooth(worldPos - float3(0, 0, h));
     
-    float dx = SampleDensity(gridPos + int3(1, 0, 0)) - 
-               SampleDensity(gridPos - int3(1, 0, 0));
-    float dy = SampleDensity(gridPos + int3(0, 1, 0)) - 
-               SampleDensity(gridPos - int3(0, 1, 0));
-    float dz = SampleDensity(gridPos + int3(0, 0, 1)) - 
-               SampleDensity(gridPos - int3(0, 0, 1));
+    // Calculate and normalize the gradient
+    float3 normal = normalize(float3(-dx, -dy, -dz));
     
-    return normalize(float3(-dx, -dy, -dz));
+    // Ensure we have a valid normal
+    if (length(normal) < 0.5 || any(isnan(normal)))
+        normal = float3(0, 1, 0);
+    
+    return normal;
 }
 
-// Main mesh extraction kernel - using structured buffer approach
-[numthreads(4, 4, 4)]
+// Main mesh extraction kernel - now processes entire chunk in one thread group
+[numthreads(1, 1, 1)]
 void ExtractMesh(uint3 id : SV_DispatchThreadID)
 {
-    // Check bounds
-    if (any(id >= uint3(ChunkSize, ChunkSize, ChunkSize)))
-        return;
-    
-    // Convert to int3 for easier math
-    int3 basePos = int3(id.x, id.y, id.z);
-    
-    // Sample corner densities
-    float cornerDensities[8];
-    int3 cornerCoords[8];
-    
-    [unroll]
-    for (int c = 0; c < 8; c++)
+    // Reset counter at start
+    if (id.x == 0 && id.y == 0 && id.z == 0)
     {
-        cornerCoords[c] = basePos + int3(CornerOffsets[c]);
-        cornerDensities[c] = SampleDensity(cornerCoords[c]);
+        VertexCounter[0] = 0;
     }
     
-    // Calculate cube index
-    int cubeIndex = 0;
-    [unroll]
-    for (int c2 = 0; c2 < 8; c2++)
-    {
-        if (cornerDensities[c2] < ISO_LEVEL)
-            cubeIndex |= (1 << c2);
-    }
+    // Process the entire chunk
+    int3 chunkBase = int3(ChunkCoord.x, ChunkCoord.y, ChunkCoord.z);
+    float3 worldOffset = float3(chunkBase) * ChunkSize * VoxelSize;
     
-    // Skip if no triangles
-    if (EdgeTable[cubeIndex] == 0)
-        return;
+    uint vertexIndex = 0;
     
-    // Calculate edge vertices
-    float3 edgeVertices[12];
-    [unroll]
-    for (int e = 0; e < 12; e++)
+    // Process each voxel in the chunk
+    for (int z = 0; z < ChunkSize - 1; z++)
     {
-        if (EdgeTable[cubeIndex] & (1 << e))
+        for (int y = 0; y < ChunkSize - 1; y++)
         {
-            int2 edge = EdgeConnections[e];
-            float3 p1 = float3(cornerCoords[edge.x]);
-            float3 p2 = float3(cornerCoords[edge.y]);
-            edgeVertices[e] = InterpolateVertex(p1, p2, cornerDensities[edge.x], cornerDensities[edge.y]);
+            for (int x = 0; x < ChunkSize - 1; x++)
+            {
+                int3 basePos = int3(x, y, z);
+                
+                // Sample corner densities
+                float cornerDensities[8];
+                float3 cornerPositions[8];
+                
+                for (int c = 0; c < 8; c++)
+                {
+                    int3 cornerCoord = basePos + int3(CornerOffsets[c]);
+                    cornerDensities[c] = SampleDensity(cornerCoord);
+                    cornerPositions[c] = float3(cornerCoord);
+                }
+                
+                // Calculate cube index
+                int cubeIndex = 0;
+                for (int i = 0; i < 8; i++)
+                {
+                    if (cornerDensities[i] < ISO_LEVEL)
+                        cubeIndex |= (1 << i);
+                }
+                
+                // Skip if no triangles
+                if (EdgeTable[cubeIndex] == 0)
+                    continue;
+                
+                // Calculate edge vertices with smooth interpolation
+                float3 edgeVertices[12];
+                float3 edgeNormals[12];
+                
+                for (int e = 0; e < 12; e++)
+                {
+                    if (EdgeTable[cubeIndex] & (1 << e))
+                    {
+                        int2 edge = EdgeConnections[e];
+                        float3 p1 = cornerPositions[edge.x];
+                        float3 p2 = cornerPositions[edge.y];
+                        
+                        // Interpolate vertex position
+                        float3 interpPos = InterpolateVertex(p1, p2, 
+                            cornerDensities[edge.x], cornerDensities[edge.y]);
+                        
+                        // Convert to world space
+                        edgeVertices[e] = interpPos * VoxelSize + worldOffset;
+                        
+                        // Calculate smooth normal at this position
+                        edgeNormals[e] = CalculateSmoothNormal(edgeVertices[e]);
+                    }
+                }
+                
+                // Generate triangles
+                for (int t = 0; t < 16; t += 3)
+                {
+                    int e0 = TriTable[cubeIndex][t];
+                    if (e0 == -1)
+                        break;
+                    
+                    int e1 = TriTable[cubeIndex][t + 1];
+                    int e2 = TriTable[cubeIndex][t + 2];
+                    
+                    if (e1 == -1 || e2 == -1)
+                        break;
+                    
+                    // Get the base index for new vertices
+                    uint baseIndex;
+                    InterlockedAdd(VertexCounter[0], 3, baseIndex);
+                    
+                    // Make sure we don't overflow
+                    if (baseIndex + 2 >= 15000)
+                        return;
+                    
+                    // Store vertices
+                    VertexBuffer[baseIndex] = edgeVertices[e0];
+                    VertexBuffer[baseIndex + 1] = edgeVertices[e1];
+                    VertexBuffer[baseIndex + 2] = edgeVertices[e2];
+                    
+                    // Store smooth normals
+                    NormalBuffer[baseIndex] = edgeNormals[e0];
+                    NormalBuffer[baseIndex + 1] = edgeNormals[e1];
+                    NormalBuffer[baseIndex + 2] = edgeNormals[e2];
+                    
+                    // Store indices
+                    IndexBuffer[baseIndex] = baseIndex;
+                    IndexBuffer[baseIndex + 1] = baseIndex + 1;
+                    IndexBuffer[baseIndex + 2] = baseIndex + 2;
+                }
+            }
         }
-    }
-    
-    // Generate triangles from the triangle table
-    float3 worldOffset = ChunkCoord.xyz * ChunkSize * VoxelSize;
-    
-    // Process triangles for this configuration
-    // We need to use the FULL TriTable here - abbreviated for space
-    // In practice, copy the full table from MarchingCubesTables.cs
-    for (int t = 0; t < 16 && TriTable[cubeIndex][t] != -1; t += 3)
-    {
-        // Get the three edge indices for this triangle
-        int e0 = TriTable[cubeIndex][t];
-        int e1 = TriTable[cubeIndex][t + 1];
-        int e2 = TriTable[cubeIndex][t + 2];
-        
-        if (e0 == -1) break;
-        
-        // Get vertex positions in world space
-        float3 v0 = edgeVertices[e0] * VoxelSize + worldOffset;
-        float3 v1 = edgeVertices[e1] * VoxelSize + worldOffset;
-        float3 v2 = edgeVertices[e2] * VoxelSize + worldOffset;
-        
-        // Calculate normals at each vertex
-        float3 n0 = CalculateNormal(v0);
-        float3 n1 = CalculateNormal(v1);
-        float3 n2 = CalculateNormal(v2);
-        
-        // Get current vertex count atomically and allocate space for 3 vertices
-        uint baseIndex = 0;
-        InterlockedAdd(VertexCount[0], 3, baseIndex);
-        
-        // Write vertices
-        Vertices[baseIndex + 0] = v0;
-        Vertices[baseIndex + 1] = v1;
-        Vertices[baseIndex + 2] = v2;
-        
-        // Write normals
-        Normals[baseIndex + 0] = n0;
-        Normals[baseIndex + 1] = n1;
-        Normals[baseIndex + 2] = n2;
-        
-        // Write indices
-        Indices[baseIndex + 0] = baseIndex + 0;
-        Indices[baseIndex + 1] = baseIndex + 1;
-        Indices[baseIndex + 2] = baseIndex + 2;
     }
 }
 
-// Optional: First pass to count vertices for better allocation
-[numthreads(4, 4, 4)]
+// Simplified vertex counting kernel
+[numthreads(1, 1, 1)]
 void CountVertices(uint3 id : SV_DispatchThreadID)
 {
-    // Similar to ExtractMesh but only counts vertices
-    if (any(id >= uint3(ChunkSize - 1, ChunkSize - 1, ChunkSize - 1)))
-        return;
+    VertexCounter[0] = 0;
     
-    int3 basePos = int3(id.x, id.y, id.z);
+    int triangleCount = 0;
     
-    float cornerDensities[8];
-    [unroll]
-    for (int c = 0; c < 8; c++)
+    for (int z = 0; z < ChunkSize - 1; z++)
     {
-        int3 coord = basePos + int3(CornerOffsets[c]);
-        cornerDensities[c] = SampleDensity(coord);
-    }
-    
-    int cubeIndex = 0;
-    [unroll]
-    for (int c2 = 0; c2 < 8; c2++)
-    {
-        if (cornerDensities[c2] < ISO_LEVEL)
-            cubeIndex |= (1 << c2);
-    }
-    
-    if (EdgeTable[cubeIndex] != 0)
-    {
-        int triangleCount = 0;
-        for (int t = 0; t < 16 && TriTable[cubeIndex][t] != -1; t += 3)
+        for (int y = 0; y < ChunkSize - 1; y++)
         {
-            triangleCount++;
-        }
-        
-        if (triangleCount > 0)
-        {
-            InterlockedAdd(VertexCount[0], triangleCount * 3);
+            for (int x = 0; x < ChunkSize - 1; x++)
+            {
+                int3 basePos = int3(x, y, z);
+                
+                float cornerDensities[8];
+                for (int c = 0; c < 8; c++)
+                {
+                    int3 coord = basePos + int3(CornerOffsets[c]);
+                    cornerDensities[c] = SampleDensity(coord);
+                }
+                
+                int cubeIndex = 0;
+                for (int i = 0; i < 8; i++)
+                {
+                    if (cornerDensities[i] < ISO_LEVEL)
+                        cubeIndex |= (1 << i);
+                }
+                
+                if (EdgeTable[cubeIndex] != 0)
+                {
+                    for (int t = 0; t < 16; t += 3)
+                    {
+                        if (TriTable[cubeIndex][t] == -1)
+                            break;
+                        triangleCount++;
+                    }
+                }
+            }
         }
     }
+    
+    VertexCounter[0] = triangleCount * 3;
 }
