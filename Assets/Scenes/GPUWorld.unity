@@ -145,7 +145,7 @@ Transform:
   m_GameObject: {fileID: 53067958}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalPosition: {x: 64, y: 20, z: 64}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -337,8 +337,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   meshExtractionShader: {fileID: 7200000, guid: 4b2e735acff3ef8409582ffea184ed09, type: 3}
   chunkMaterial: {fileID: 2100000, guid: 97ebab7fd75682045b62c72a2e1ba00f, type: 2}
-  maxVerticesPerChunk: 45000
-  debugLogging: 0
+  maxVerticesPerChunk: 60000
+  smoothNormals: 1
 --- !u!114 &778956057
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -359,9 +359,9 @@ MonoBehaviour:
   worldSizeChunks: 16
   worldHeightChunks: 8
   voxelSize: 0.25
-  viewDistance: 10
+  viewDistance: 8
   generationSettings: {fileID: 11400000, guid: 802ba4d005950c44a949e6e1df66d837, type: 2}
-  chunksPerFrame: 4
+  chunksPerFrame: 32
   updateInterval: 0.1
 --- !u!4 &778956058
 Transform:

@@ -20,5 +20,5 @@ MonoBehaviour:
   minCaveHeight: -1000
   maxCaveHeight: 1000
   chamberProbability: 0.1
-  minChamberRadius: 10
-  maxChamberRadius: 30
+  minChamberRadius: 5
+  maxChamberRadius: 40
