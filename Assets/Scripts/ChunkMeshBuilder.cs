@@ -127,7 +127,7 @@ namespace GPUTerrain
             
             // Set parameters
             meshExtractionShader.SetTexture(kernel, "WorldData", worldDataTexture);
-            meshExtractionShader.SetVector("ChunkCoord", new Vector4(chunkCoord.x, chunkCoord.y, chunkCoord.z, 0));
+            meshExtractionShader.SetInts("ChunkCoord", chunkCoord.x, chunkCoord.y, chunkCoord.z);
             meshExtractionShader.SetFloat("VoxelSize", worldManager.VoxelSize);
             meshExtractionShader.SetInt("ChunkSize", TerrainWorldManager.CHUNK_SIZE);
             

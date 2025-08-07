@@ -6,25 +6,25 @@ public class TerrainTestController : MonoBehaviour
 {
     [Header("References")]
     public TerrainWorldManager terrainManager;
-    
+
     [Header("Player Movement")]
     public float moveSpeed = 10f;
     public float lookSpeed = 2f;
     public float flySpeed = 20f;
-    
+
     private Camera playerCamera;
     private float rotationX = 0f;
-    
+
     void Start()
     {
         playerCamera = GetComponent<Camera>();
         if (playerCamera == null)
             playerCamera = GetComponentInChildren<Camera>();
-        
+
         // Lock cursor for FPS controls
         Cursor.lockState = CursorLockMode.Locked;
         Cursor.visible = false;
-        
+
         // Create terrain manager if not assigned
         if (terrainManager == null)
         {
@@ -33,57 +33,57 @@ public class TerrainTestController : MonoBehaviour
             Debug.Log("Created Terrain World Manager");
         }
     }
-    
+
     void Update()
     {
         HandleMovement();
         HandleMouseLook();
         HandleDebugInputs();
     }
-    
+
     void HandleMovement()
     {
         float horizontal = Input.GetAxis("Horizontal");
         float vertical = Input.GetAxis("Vertical");
         float upDown = 0f;
-        
+
         if (Input.GetKey(KeyCode.Space))
             upDown = 1f;
         else if (Input.GetKey(KeyCode.LeftShift))
             upDown = -1f;
-        
+
         float currentSpeed = Input.GetKey(KeyCode.LeftControl) ? flySpeed : moveSpeed;
-        
+
         Vector3 movement = new Vector3(horizontal, upDown, vertical);
         movement = transform.TransformDirection(movement);
         movement *= currentSpeed * Time.deltaTime;
-        
+
         transform.position += movement;
     }
-    
+
     void HandleMouseLook()
     {
         float mouseX = Input.GetAxis("Mouse X") * lookSpeed;
         float mouseY = Input.GetAxis("Mouse Y") * lookSpeed;
-        
+
         rotationX -= mouseY;
         rotationX = Mathf.Clamp(rotationX, -90f, 90f);
-        
+
         playerCamera.transform.localRotation = Quaternion.Euler(rotationX, 0f, 0f);
         transform.Rotate(Vector3.up * mouseX);
     }
-    
+
     void HandleDebugInputs()
     {
         // Toggle cursor lock
         if (Input.GetKeyDown(KeyCode.Escape))
         {
-            Cursor.lockState = Cursor.lockState == CursorLockMode.Locked 
-                ? CursorLockMode.None 
+            Cursor.lockState = Cursor.lockState == CursorLockMode.Locked
+                ? CursorLockMode.None
                 : CursorLockMode.Locked;
             Cursor.visible = !Cursor.visible;
         }
-        
+
         // Reload shaders (for development)
         if (Input.GetKeyDown(KeyCode.R) && Input.GetKey(KeyCode.LeftControl))
         {
@@ -95,15 +95,52 @@ public class TerrainTestController : MonoBehaviour
                 terrainManager.enabled = true;
             }
         }
+
+        // Add terrain modification controls
+        if (Input.GetMouseButton(0) && Input.GetKey(KeyCode.LeftAlt))
+        {
+            // Left click + Alt = dig/remove terrain
+            RaycastHit hit;
+            Ray ray = playerCamera.ScreenPointToRay(Input.mousePosition);
+
+            if (Physics.Raycast(ray, out hit, 100f))
+            {
+                terrainManager.ModifyTerrainAt(hit.point, 2f, -1f);
+            }
+        }
+        else if (Input.GetMouseButton(1) && Input.GetKey(KeyCode.LeftAlt))
+        {
+            // Right click + Alt = add terrain
+            RaycastHit hit;
+            Ray ray = playerCamera.ScreenPointToRay(Input.mousePosition);
+
+            if (Physics.Raycast(ray, out hit, 100f))
+            {
+                terrainManager.ModifyTerrainAt(hit.point, 2f, 1f);
+            }
+        }
+
+        // Debug key to log statistics
+        if (Input.GetKeyDown(KeyCode.F1))
+        {
+            terrainManager.LogStatistics();
+        }
+
+        // Regenerate world
+        if (Input.GetKeyDown(KeyCode.F5))
+        {
+            Debug.Log("Regenerating world...");
+            terrainManager.RegenerateWorld();
+        }
     }
-    
+
     void OnGUI()
     {
         // Debug information
         int yOffset = 10;
         GUI.Label(new Rect(10, yOffset, 300, 20), $"Position: {transform.position}");
         yOffset += 20;
-        
+
         GUI.Label(new Rect(10, yOffset, 300, 20), "Controls:");
         yOffset += 20;
         GUI.Label(new Rect(10, yOffset, 300, 20), "WASD - Move");
@@ -113,6 +150,21 @@ public class TerrainTestController : MonoBehaviour
         GUI.Label(new Rect(10, yOffset, 300, 20), "Ctrl - Fast Movement");
         yOffset += 20;
         GUI.Label(new Rect(10, yOffset, 300, 20), "ESC - Toggle Cursor");
+        yOffset += 20;
+        GUI.Label(new Rect(10, yOffset, 300, 20), "Alt + Left Click - Dig Terrain");
+        yOffset += 20;
+        GUI.Label(new Rect(10, yOffset, 300, 20), "Alt + Right Click - Add Terrain");
+        yOffset += 20;
+        GUI.Label(new Rect(10, yOffset, 300, 20), "F1 - Show Statistics");
+        yOffset += 20;
+        GUI.Label(new Rect(10, yOffset, 300, 20), "F5 - Regenerate World");
+
+        // Show chunk info if available
+        if (terrainManager != null)
+        {
+            yOffset += 30;
+            GUI.Label(new Rect(10, yOffset, 300, 20), $"Update Queue: {terrainManager.GetUpdateQueueSize()}");
+        }
     }
 }
 

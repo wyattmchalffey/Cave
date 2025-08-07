@@ -210,10 +210,11 @@ namespace GPUTerrain
         {
             try
             {
-                // Create 3D world data texture
-                int texSize = worldSizeChunks * CHUNK_SIZE;
-                int texHeight = worldHeightChunks * CHUNK_SIZE;
-                
+                // Create 3D world data texture (now with padding) 
+                int paddedChunkSize = CHUNK_SIZE_PLUS_ONE; // Should be 33
+                int texSize = worldSizeChunks * paddedChunkSize;
+                int texHeight = worldHeightChunks * paddedChunkSize;
+
                 worldDataTexture = new RenderTexture(texSize, texHeight, 0, RenderTextureFormat.ARGBFloat);
                 worldDataTexture.dimension = TextureDimension.Tex3D;
                 worldDataTexture.volumeDepth = texSize;
@@ -345,9 +346,10 @@ namespace GPUTerrain
             if (terrainGenerationShader != null && clearWorldKernel >= 0)
             {
                 terrainGenerationShader.SetTexture(clearWorldKernel, "WorldData", worldDataTexture);
-                
-                int texSize = worldSizeChunks * CHUNK_SIZE;
-                int texHeight = worldHeightChunks * CHUNK_SIZE;
+
+                int paddedChunkSize = CHUNK_SIZE_PLUS_ONE;
+                int texSize = worldSizeChunks * paddedChunkSize;
+                int texHeight = worldHeightChunks * paddedChunkSize;
                 int threadGroups = Mathf.CeilToInt(texSize / 8.0f);
                 int threadGroupsY = Mathf.CeilToInt(texHeight / 8.0f);
                 
@@ -502,23 +504,27 @@ namespace GPUTerrain
                 state.isGenerating = true;
                 chunkStates[chunkCoord] = state;
             }
-            
+
             // Set parameters
             terrainGenerationShader.SetTexture(generateTerrainKernel, "WorldData", worldDataTexture);
-            terrainGenerationShader.SetVector("ChunkCoord", new Vector4(chunkCoord.x, chunkCoord.y, chunkCoord.z, 0));
+            terrainGenerationShader.SetInts("ChunkCoord", new int[] { chunkCoord.x, chunkCoord.y, chunkCoord.z });
             terrainGenerationShader.SetFloat("VoxelSize", voxelSize);
             terrainGenerationShader.SetInt("ChunkSize", CHUNK_SIZE);
-            
+
+            // Generate N+1 voxels for seamless Marching Cubes boundaries.
+            const int generationSize = CHUNK_SIZE + 1;
+            terrainGenerationShader.SetInt("GenerationSize", generationSize);
+
             // Apply generation settings
             if (generationSettings != null)
             {
                 generationSettings.ApplyToComputeShader(terrainGenerationShader, generateTerrainKernel);
             }
-            
+
             // Dispatch
-            int threadGroups = Mathf.CeilToInt(CHUNK_SIZE / 8.0f);
+            int threadGroups = Mathf.CeilToInt(generationSize / 8.0f);
             terrainGenerationShader.Dispatch(generateTerrainKernel, threadGroups, threadGroups, threadGroups);
-            
+
             // Update state
             if (chunkStates.TryGetValue(chunkCoord, out state))
             {
