@@ -1,4 +1,4 @@
-// TerrainWorldManager.cs - Fixed version with proper chunk generation pattern
+// TerrainWorldManager.cs - Updated for Unity 6.1 with GraphicsBuffer
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -37,14 +37,14 @@ namespace GPUTerrain
         public const int MAX_VERTICES_PER_CHUNK = 15000;
         public const int MAX_CHUNKS = 2048;
         
-        // Persistent GPU resources
+        // Persistent GPU resources - Updated to use GraphicsBuffer where appropriate
         private RenderTexture worldDataTexture;
-        private ComputeBuffer chunkMetadataBuffer;
-        private ComputeBuffer vertexPoolBuffer;
-        private ComputeBuffer indexPoolBuffer;
-        private ComputeBuffer drawArgsBuffer;
-        private ComputeBuffer visibleChunksBuffer;
-        private ComputeBuffer updateCommandBuffer;
+        private GraphicsBuffer chunkMetadataBuffer;  // Changed from ComputeBuffer
+        private GraphicsBuffer vertexPoolBuffer;     // Changed from ComputeBuffer
+        private GraphicsBuffer indexPoolBuffer;      // Changed from ComputeBuffer
+        private GraphicsBuffer drawArgsBuffer;       // Changed from ComputeBuffer
+        private GraphicsBuffer visibleChunksBuffer;  // Changed from ComputeBuffer
+        private GraphicsBuffer updateCommandBuffer;  // Changed from ComputeBuffer
         
         // World state
         private Dictionary<int3, ChunkState> chunkStates = new Dictionary<int3, ChunkState>();
@@ -230,9 +230,15 @@ namespace GPUTerrain
                     return false;
                 }
                 
-                // Initialize buffers
+                // Initialize buffers - Now using GraphicsBuffer for better Unity 6.1 compatibility
                 int totalChunks = worldSizeChunks * worldHeightChunks * worldSizeChunks;
-                chunkMetadataBuffer = new ComputeBuffer(totalChunks, ChunkMetadata.Size);
+                
+                // Use GraphicsBuffer instead of ComputeBuffer for Unity 6.1
+                chunkMetadataBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    totalChunks,
+                    ChunkMetadata.Size
+                );
                 
                 // Initialize chunk metadata
                 ChunkMetadata[] initialMetadata = new ChunkMetadata[totalChunks];
@@ -250,20 +256,41 @@ namespace GPUTerrain
                 }
                 chunkMetadataBuffer.SetData(initialMetadata);
                 
-                // Vertex and index pools
+                // Vertex and index pools - Using GraphicsBuffer
                 int totalVertices = MAX_VERTICES_PER_CHUNK * MAX_CHUNKS;
-                vertexPoolBuffer = new ComputeBuffer(totalVertices, TerrainVertex.Size);
-                indexPoolBuffer = new ComputeBuffer(totalVertices * 3, sizeof(uint));
+                vertexPoolBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    totalVertices,
+                    TerrainVertex.Size
+                );
                 
-                // Draw args for indirect rendering
-                drawArgsBuffer = new ComputeBuffer(5, sizeof(uint), ComputeBufferType.IndirectArguments);
+                indexPoolBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.Index,
+                    totalVertices * 3,
+                    sizeof(uint)
+                );
+                
+                // Draw args for indirect rendering - Using GraphicsBuffer with proper target
+                drawArgsBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.IndirectArguments,
+                    5,
+                    sizeof(uint)
+                );
                 drawArgsBuffer.SetData(new uint[] { 0, 1, 0, 0, 0 });
                 
-                // Visible chunks buffer
-                visibleChunksBuffer = new ComputeBuffer(MAX_CHUNKS, ChunkMetadata.Size, ComputeBufferType.Append);
+                // Visible chunks buffer - Using GraphicsBuffer with Append capability
+                visibleChunksBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.Append,
+                    MAX_CHUNKS,
+                    ChunkMetadata.Size
+                );
                 
                 // Update command buffer
-                updateCommandBuffer = new ComputeBuffer(64, WorldUpdateCommand.Size);
+                updateCommandBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.Structured,
+                    64,
+                    WorldUpdateCommand.Size
+                );
                 
                 return true;
             }
@@ -446,7 +473,6 @@ namespace GPUTerrain
             int3 viewerChunk = WorldToChunkCoord(viewerPos);
             
             // Update chunk visibility based on distance
-            // FIXED: Generate chunks in a rectangular pattern, not circular
             for (int y = 0; y < worldHeightChunks; y++)
             {
                 for (int z = -viewDistance; z <= viewDistance; z++)
@@ -462,13 +488,7 @@ namespace GPUTerrain
                         // Check bounds
                         if (IsChunkInBounds(chunkCoord))
                         {
-                            // FIXED: Use rectangular pattern instead of circular distance check
-                            // This ensures all chunks in the view distance are generated
                             bool shouldGenerate = true;
-                            
-                            // Optional: Use a slightly larger circular check if you want rounded corners
-                            // float distance = math.length(new float3(x, 0, z));
-                            // bool shouldGenerate = distance <= viewDistance * 1.42f; // sqrt(2) for corners
                             
                             if (shouldGenerate)
                             {
@@ -610,7 +630,6 @@ namespace GPUTerrain
             {
                 if (kvp.Value.hasMesh)
                 {
-                    // FIXED: Use chunk grid distance, not world distance
                     int3 chunkOffset = kvp.Key - viewerChunk;
                     float distance = math.max(math.abs(chunkOffset.x), math.abs(chunkOffset.z));
                     
@@ -764,7 +783,6 @@ namespace GPUTerrain
             float3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
             int3 viewerChunk = WorldToChunkCoord(viewerPos);
             
-            // FIXED: Use rectangular check
             int3 chunkOffset = coord - viewerChunk;
             bool inRange = math.abs(chunkOffset.x) <= viewDistance && 
                           math.abs(chunkOffset.z) <= viewDistance;
@@ -774,14 +792,14 @@ namespace GPUTerrain
         
         void OnDestroy()
         {
-            // Clean up GPU resources
+            // Clean up GPU resources - GraphicsBuffer uses Dispose() instead of Release()
             worldDataTexture?.Release();
-            chunkMetadataBuffer?.Release();
-            vertexPoolBuffer?.Release();
-            indexPoolBuffer?.Release();
-            drawArgsBuffer?.Release();
-            visibleChunksBuffer?.Release();
-            updateCommandBuffer?.Release();
+            chunkMetadataBuffer?.Dispose();
+            vertexPoolBuffer?.Dispose();
+            indexPoolBuffer?.Dispose();
+            drawArgsBuffer?.Dispose();
+            visibleChunksBuffer?.Dispose();
+            updateCommandBuffer?.Dispose();
         }
         
         void OnDrawGizmosSelected()
@@ -802,7 +820,6 @@ namespace GPUTerrain
                     Vector3 viewerPos = playerTransform != null ? playerTransform.position : mainCamera.transform.position;
                     Gizmos.color = Color.cyan;
                     
-                    // FIXED: Draw rectangular view area
                     float chunkSize = CHUNK_SIZE * voxelSize;
                     Vector3 viewSize = new Vector3(
                         viewDistance * 2 * chunkSize,
